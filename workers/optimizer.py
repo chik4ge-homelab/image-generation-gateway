@@ -22,6 +22,16 @@ def _write_result(path: Path, result: dict[str, str]) -> None:
     path.write_bytes(encoded)
 
 
+def _run_llama(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+        timeout=TIMEOUT_SECONDS,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -54,7 +64,7 @@ def main() -> None:
         },
         separators=(",", ":"),
     )
-    completed = subprocess.run(
+    completed = _run_llama(
         [
             "/app/llama-cli",
             "-m",
@@ -79,10 +89,6 @@ def main() -> None:
             "--no-warmup",
             "--simple-io",
         ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=TIMEOUT_SECONDS,
     )
     start = completed.stdout.find("{")
     end = completed.stdout.rfind("}")

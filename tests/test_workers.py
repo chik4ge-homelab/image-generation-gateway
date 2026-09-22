@@ -1,4 +1,5 @@
 import importlib.util
+import subprocess
 from pathlib import Path
 
 
@@ -30,3 +31,18 @@ def test_optimizer_has_bounded_gpu_inference():
     assert optimizer.GPU_LAYERS == "99"
     assert optimizer.THREADS == "4"
     assert optimizer.TIMEOUT_SECONDS == 300
+
+
+def test_optimizer_does_not_buffer_llama_stderr(monkeypatch):
+    optimizer = _load("optimizer")
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout="{}")
+
+    monkeypatch.setattr(optimizer.subprocess, "run", fake_run)
+    optimizer._run_llama(["llama-cli"])
+    assert captured["stdout"] is subprocess.PIPE
+    assert "stderr" not in captured
+    assert "capture_output" not in captured
