@@ -37,6 +37,12 @@ def test_job_manifests_are_deterministic_and_have_safety_limits():
         )
     assert "envFrom" not in optimizer["spec"]["template"]["spec"]["containers"][0]
     assert diffuser["spec"]["template"]["spec"]["containers"][0]["envFrom"]
+    optimizer_resources = optimizer["spec"]["template"]["spec"]["containers"][0]["resources"]
+    diffuser_resources = diffuser["spec"]["template"]["spec"]["containers"][0]["resources"]
+    assert optimizer_resources["requests"]["memory"] == "4Gi"
+    assert optimizer_resources["limits"]["memory"] == "8Gi"
+    assert diffuser_resources["requests"]["memory"] == "6Gi"
+    assert diffuser_resources["limits"]["memory"] == "12Gi"
     optimizer_env = optimizer["spec"]["template"]["spec"]["containers"][0]["env"]
     diffuser_env = diffuser["spec"]["template"]["spec"]["containers"][0]["env"]
     assert {item["name"]: item["value"] for item in optimizer_env}["MODEL_PATH"] == (

@@ -112,8 +112,17 @@ def _common_job(
     if artifact_credentials:
         container["envFrom"] = [{"secretRef": {"name": settings.object_bucket_secret_name}}]
     if gpu:
-        resources = {settings.gpu_resource_name: str(settings.gpu_count)}
-        container["resources"] = {"requests": resources, "limits": resources}
+        gpu_resources = {settings.gpu_resource_name: str(settings.gpu_count)}
+        if container_name == "diffuser":
+            container["resources"] = {
+                "requests": {"cpu": "2", "memory": "6Gi", **gpu_resources},
+                "limits": {"memory": "12Gi", **gpu_resources},
+            }
+        else:
+            container["resources"] = {
+                "requests": {"cpu": "2", "memory": "4Gi", **gpu_resources},
+                "limits": {"memory": "8Gi", **gpu_resources},
+            }
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
