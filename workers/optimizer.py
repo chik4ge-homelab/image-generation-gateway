@@ -8,6 +8,10 @@ from pathlib import Path
 
 MAX_OUTPUT_BYTES = 4096
 RATIOS = ("1:1", "3:2", "2:3", "16:9", "9:16")
+MAX_TOKENS = "256"
+GPU_LAYERS = "99"
+THREADS = "4"
+TIMEOUT_SECONDS = 300
 
 
 def _write_result(path: Path, result: dict[str, str]) -> None:
@@ -57,7 +61,11 @@ def main() -> None:
             "-p",
             instruction,
             "-n",
-            "1024",
+            MAX_TOKENS,
+            "-ngl",
+            GPU_LAYERS,
+            "-t",
+            THREADS,
             "--temp",
             "0",
             "--seed",
@@ -71,6 +79,7 @@ def main() -> None:
         check=True,
         capture_output=True,
         text=True,
+        timeout=TIMEOUT_SECONDS,
     )
     start = completed.stdout.find("{")
     end = completed.stdout.rfind("}")
