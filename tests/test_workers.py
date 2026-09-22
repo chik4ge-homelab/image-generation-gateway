@@ -25,7 +25,8 @@ def test_optimizer_and_diffuser_support_the_same_ratios():
 
 def test_optimizer_has_bounded_gpu_inference():
     optimizer = _load("optimizer")
-    assert optimizer.MAX_TOKENS == "256"
+    assert optimizer.MAX_TOKENS == "1024"
+    assert optimizer.CONTEXT_SIZE == "2048"
     assert optimizer.GPU_LAYERS == "99"
     assert optimizer.THREADS == "4"
     assert optimizer.TIMEOUT_SECONDS == 300

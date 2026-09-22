@@ -8,7 +8,8 @@ from pathlib import Path
 
 MAX_OUTPUT_BYTES = 4096
 RATIOS = ("1:1", "3:2", "2:3", "16:9", "9:16")
-MAX_TOKENS = "256"
+MAX_TOKENS = "1024"
+CONTEXT_SIZE = "2048"
 GPU_LAYERS = "99"
 THREADS = "4"
 TIMEOUT_SECONDS = 300
@@ -35,7 +36,7 @@ def main() -> None:
 
     model_path = os.environ["MODEL_PATH"]
     instruction = (
-        "Rewrite the image-generation request as one precise English prompt. "
+        "Expand the image-generation request into a precise, detailed English prompt. "
         "Preserve the user's subject, composition, text, mood, and constraints. "
         "Return JSON only with rewritten_prompt and wh_ratio. "
         f"wh_ratio must be one of {', '.join(RATIOS)} and should normally be "
@@ -62,6 +63,8 @@ def main() -> None:
             instruction,
             "-n",
             MAX_TOKENS,
+            "-c",
+            CONTEXT_SIZE,
             "-ngl",
             GPU_LAYERS,
             "-t",
