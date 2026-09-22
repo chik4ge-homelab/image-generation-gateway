@@ -1,0 +1,44 @@
+# image-generation-gateway
+
+CPU-only `image-api` and single-consumer `gpu-mode-controller` are shipped in one Python 3.12 image. The mode is selected by the CLI subcommand; llama.cpp, Diffusers, model binaries, and generated image bytes are not included.
+
+The same Dockerfile also exposes `optimizer` and `diffuser` build targets. They wrap the upstream llama.cpp and stable-diffusion.cpp CUDA images with the strict `/inputs/input.json` to `/dev/termination-log` contract expected by the controller.
+
+## Run
+
+```sh
+python -m pip install ".[dev]"
+image-gateway api
+image-gateway controller
+```
+
+The API listens on port `IMAGE_GATEWAY_PORT` (default `8080`). The controller polls FIFO requests and never processes more than one request at a time.
+
+## API
+
+- `POST /v1/images/jobs` creates an `ImageGenerationRequest` with `spec.suspend=true`.
+- `GET /v1/images/jobs/{job_id}` returns the CR state.
+- `POST /v1/images/jobs/{job_id}/start` changes `spec.suspend` to `false`.
+- `GET /v1/images/jobs/{job_id}/artifact` returns artifact metadata and its object endpoint URL after success.
+- `/healthz` and `/readyz` are available for probes.
+
+`job_id` and the CR name are deterministic from the idempotency key. A retry after a create conflict reads the same CR and returns it.
+
+## Controller configuration
+
+The controller requires these environment variables:
+
+`IMAGE_NAMESPACE`, `OPTIMIZER_IMAGE`, `DIFFUSER_IMAGE`, `OPTIMIZER_MODEL_PATH`, `DIFFUSER_MODEL_PATH`, `OBJECT_BUCKET_SECRET_NAME`, and `ARTIFACT_ENDPOINT`.
+
+Optional settings are `ARTIFACT_PREFIX`, `MODEL_PVC_NAME`, `JOB_SERVICE_ACCOUNT_NAME`, `LLM_NAMESPACE`, `LLM_DEPLOYMENT_NAME`, `LLM_POD_LABEL_SELECTOR`, `GPU_RESOURCE_NAME`, `GPU_COUNT`, `GPU_RUNTIME_CLASS_NAME`, `JOB_ACTIVE_DEADLINE_SECONDS`, `JOB_TTL_SECONDS`, `LLM_STOP_TIMEOUT_SECONDS`, `LLM_RESTORE_TIMEOUT_SECONDS`, and `CONTROLLER_POLL_INTERVAL_SECONDS`.
+
+The optimizer and diffuser containers receive input through a mounted ConfigMap at `/inputs/input.json` and must write a single JSON result to `/dev/termination-log` using their image-specific entrypoint. The optimizer result is exactly `rewritten_prompt` and `wh_ratio`, and the diffuser result is exactly `key`, `sha256`, `content_type`, `width`, and `height`, with a maximum serialized size of 4 KiB. The diffuser uploads the image directly to the object bucket; the controller verifies the returned key and SHA-256 through the OBC-provided S3 credentials when they are present, falling back to an unauthenticated HTTP endpoint otherwise.
+
+The API process only uses custom-resource create/get/patch operations. The controller uses custom-resource get/list/watch-equivalent polling and status updates, the named Deployment scale subresource, Jobs, Pods, and ConfigMaps. Deployment manifests and RBAC are intentionally left to `homelab-applications`.
+
+## Checks
+
+```sh
+ruff check .
+pytest
+```
