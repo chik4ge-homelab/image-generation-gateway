@@ -1,5 +1,5 @@
 from image_gateway.config import Settings
-from image_gateway.manifests import diffuser_job, optimizer_job
+from image_gateway.manifests import diffuser_job, optimizer_configmap, optimizer_job
 from image_gateway.naming import diffuser_job_name, optimizer_job_name
 
 from .conftest import make_cr
@@ -13,6 +13,7 @@ def test_job_manifests_are_deterministic_and_have_safety_limits():
         diffuser_model_path="/models/diffuser.safetensors",
         object_bucket_secret_name="object-bucket",
         artifact_endpoint="https://objects.example.test",
+        argocd_application_name="llm-gateway",
     )
     cr = make_cr()
     optimizer = optimizer_job(cr, settings)
@@ -20,6 +21,17 @@ def test_job_manifests_are_deterministic_and_have_safety_limits():
 
     assert optimizer["metadata"]["name"] == optimizer_job_name(cr["metadata"]["uid"])
     assert diffuser["metadata"]["name"] == diffuser_job_name(cr["metadata"]["uid"])
+    assert optimizer["metadata"]["annotations"] == {
+        "argocd.argoproj.io/tracking-id": (
+            f"llm-gateway:batch/Job:images/{optimizer['metadata']['name']}"
+        ),
+        "argocd.argoproj.io/compare-options": "IgnoreExtraneous",
+        "argocd.argoproj.io/sync-options": "Prune=false",
+    }
+    configmap = optimizer_configmap(cr, settings)
+    assert configmap["metadata"]["annotations"]["argocd.argoproj.io/tracking-id"].startswith(
+        "llm-gateway:/ConfigMap:images/"
+    )
     for job in (optimizer, diffuser):
         spec = job["spec"]
         assert spec["backoffLimit"] == 0

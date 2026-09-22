@@ -4,6 +4,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
+from .argocd import tracking_annotations
 from .cluster import ClusterError, ConflictError, KubernetesCluster, NotFoundError
 from .config import Settings
 from .models import ArtifactResponse, ImageJobCreate, ImageJobResponse, ProbeResponse
@@ -59,6 +60,13 @@ def create_app(*, cluster: Any | None = None, settings: Settings | None = None) 
                 "name": name,
                 "namespace": settings.namespace,
                 "labels": {"app.kubernetes.io/part-of": "image-generation"},
+                "annotations": tracking_annotations(
+                    settings.argocd_application_name,
+                    group="homelab.chik4ge.me",
+                    kind="ImageGenerationRequest",
+                    namespace=settings.namespace,
+                    name=name,
+                ),
             },
             "spec": {
                 **request.model_dump(by_alias=True),

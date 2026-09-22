@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .argocd import tracking_annotations
 from .config import Settings
 from .naming import (
     diffuser_configmap_name,
@@ -29,7 +30,11 @@ def owner_reference(cr: dict[str, Any]) -> dict[str, Any]:
 
 
 def _input_configmap(
-    name: str, namespace: str, owner: dict[str, Any], payload: dict[str, Any]
+    name: str,
+    namespace: str,
+    owner: dict[str, Any],
+    payload: dict[str, Any],
+    settings: Settings,
 ) -> dict[str, Any]:
     return {
         "apiVersion": "v1",
@@ -39,6 +44,13 @@ def _input_configmap(
             "namespace": namespace,
             "ownerReferences": [owner],
             "labels": {"app.kubernetes.io/part-of": "image-generation"},
+            "annotations": tracking_annotations(
+                settings.argocd_application_name,
+                group="",
+                kind="ConfigMap",
+                namespace=namespace,
+                name=name,
+            ),
         },
         "data": {"input.json": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
     }
@@ -56,6 +68,7 @@ def optimizer_configmap(cr: dict[str, Any], settings: Settings) -> dict[str, Any
             "steps": spec.get("steps", 40),
             "seed": spec.get("seed", 42),
         },
+        settings,
     )
 
 
@@ -75,6 +88,7 @@ def diffuser_configmap(
             "seed": spec.get("seed", 42),
             "artifact_key": key,
         },
+        settings,
     )
 
 
@@ -131,6 +145,13 @@ def _common_job(
             "namespace": namespace,
             "ownerReferences": [owner_reference(cr)],
             "labels": {"app.kubernetes.io/part-of": "image-generation", "image-job": name},
+            "annotations": tracking_annotations(
+                settings.argocd_application_name,
+                group="batch",
+                kind="Job",
+                namespace=namespace,
+                name=name,
+            ),
         },
         "spec": {
             "backoffLimit": 0,

@@ -15,7 +15,7 @@ def routes(app):
 
 def test_api_idempotency_and_start():
     cluster = FakeCluster()
-    settings = Settings(namespace="images")
+    settings = Settings(namespace="images", argocd_application_name="llm-gateway")
     endpoints = routes(create_app(cluster=cluster, settings=settings))
     payload = ImageJobCreate(idempotencyKey="once", prompt="a small cat")
     first = endpoints["/v1/images/jobs"](payload)
@@ -23,6 +23,14 @@ def test_api_idempotency_and_start():
     assert first["job_id"] == second["job_id"] == request_name("once")
     assert len(cluster.requests) == 1
     assert cluster.requests[("images", request_name("once"))]["spec"]["suspend"] is True
+    assert cluster.requests[("images", request_name("once"))]["metadata"]["annotations"] == {
+        "argocd.argoproj.io/tracking-id": (
+            f"llm-gateway:homelab.chik4ge.me/ImageGenerationRequest:images/"
+            f"{request_name('once')}"
+        ),
+        "argocd.argoproj.io/compare-options": "IgnoreExtraneous",
+        "argocd.argoproj.io/sync-options": "Prune=false",
+    }
 
     with pytest.raises(Exception) as conflict:
         endpoints["/v1/images/jobs"](

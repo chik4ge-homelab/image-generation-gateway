@@ -14,6 +14,7 @@ class Settings:
     object_bucket_secret_name: str = ""
     artifact_endpoint: str = ""
     artifact_prefix: str = "image-generation"
+    argocd_application_name: str = ""
     model_pvc_name: str = "image-generation-models"
     job_service_account_name: str = "image-generation-job"
     llm_namespace: str = "llm-gateway"
@@ -40,6 +41,7 @@ class Settings:
             object_bucket_secret_name=os.getenv("OBJECT_BUCKET_SECRET_NAME", ""),
             artifact_endpoint=os.getenv("ARTIFACT_ENDPOINT", ""),
             artifact_prefix=os.getenv("ARTIFACT_PREFIX", cls.artifact_prefix),
+            argocd_application_name=os.getenv("ARGOCD_APPLICATION_NAME", ""),
             model_pvc_name=os.getenv("MODEL_PVC_NAME", cls.model_pvc_name),
             job_service_account_name=os.getenv(
                 "JOB_SERVICE_ACCOUNT_NAME", cls.job_service_account_name
