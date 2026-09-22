@@ -40,7 +40,7 @@ def test_job_manifests_are_deterministic_and_have_safety_limits():
     optimizer_resources = optimizer["spec"]["template"]["spec"]["containers"][0]["resources"]
     diffuser_resources = diffuser["spec"]["template"]["spec"]["containers"][0]["resources"]
     assert optimizer_resources["requests"]["memory"] == "4Gi"
-    assert optimizer_resources["limits"]["memory"] == "8Gi"
+    assert optimizer_resources["limits"]["memory"] == "10Gi"
     assert diffuser_resources["requests"]["memory"] == "6Gi"
     assert diffuser_resources["limits"]["memory"] == "12Gi"
     optimizer_env = optimizer["spec"]["template"]["spec"]["containers"][0]["env"]
