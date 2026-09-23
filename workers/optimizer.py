@@ -52,18 +52,6 @@ def main() -> None:
         f"wh_ratio must be one of {', '.join(RATIOS)} and should normally be "
         f"{requested_ratio}. Request: {prompt}"
     )
-    schema = json.dumps(
-        {
-            "type": "object",
-            "properties": {
-                "rewritten_prompt": {"type": "string"},
-                "wh_ratio": {"type": "string", "enum": list(RATIOS)},
-            },
-            "required": ["rewritten_prompt", "wh_ratio"],
-            "additionalProperties": False,
-        },
-        separators=(",", ":"),
-    )
     completed = _run_llama(
         [
             "/app/llama-cli",
@@ -83,8 +71,6 @@ def main() -> None:
             "0",
             "--seed",
             str(request.get("seed", 42)),
-            "--json-schema",
-            schema,
             "--no-display-prompt",
             "--no-warmup",
             "--simple-io",

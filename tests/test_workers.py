@@ -33,6 +33,11 @@ def test_optimizer_has_bounded_gpu_inference():
     assert optimizer.TIMEOUT_SECONDS == 300
 
 
+def test_optimizer_relies_on_model_json_instead_of_llama_grammar():
+    source = (Path(__file__).parents[1] / "workers" / "optimizer.py").read_text()
+    assert "--json-schema" not in source
+
+
 def test_optimizer_does_not_buffer_llama_stderr(monkeypatch):
     optimizer = _load("optimizer")
     captured = {}
