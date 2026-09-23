@@ -1,146 +1,70 @@
+import json
+
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from image_gateway.api import create_app
 from image_gateway.config import Settings
-from image_gateway.models import ImageJobCreate
-from image_gateway.naming import request_name
 
 from .conftest import FakeCluster
 
 
-class SucceededCluster(FakeCluster):
+class ProxyingCluster(FakeCluster):
     def create_request(self, namespace, body):
         result = super().create_request(namespace, body)
-        result["status"] = {
-            "phase": "Succeeded",
-            "optimizer": {"rewrittenPrompt": "a carefully composed fox", "whRatio": "16:9"},
-            "artifact": {
-                "key": "image-generation/generated.png",
-                "sha256": "0" * 64,
-                "contentType": "image/png",
-                "width": 1344,
-                "height": 768,
-            },
-        }
+        status = {"phase": "Proxying", "serverUrl": "http://10.0.0.9:8080"}
+        if body["spec"].get("optimizePrompt"):
+            status["optimizer"] = {
+                "rewrittenPrompt": "an expanded prompt",
+                "whRatio": body["spec"].get("aspectRatio", "1:1"),
+            }
+        result["status"] = status
         self.requests[(namespace, body["metadata"]["name"])] = result
         return result
 
 
-def routes(app):
-    return {route.path: route.endpoint for route in app.routes if hasattr(route, "path")}
+def test_health_probes_and_custom_job_apis_are_absent():
+    client = TestClient(create_app(cluster=FakeCluster(), settings=Settings(namespace="images")))
+
+    assert client.get("/healthz").json() == {"status": "ok"}
+    assert client.get("/readyz").json() == {"status": "ready"}
+    for path, method in (
+        ("/v1/images/jobs", "post"),
+        ("/v1/images/jobs/example", "get"),
+        ("/v1/images/jobs/example/start", "post"),
+        ("/v1/images/jobs/example/artifact", "get"),
+        ("/docs", "get"),
+        ("/openapi.json", "get"),
+    ):
+        assert getattr(client, method)(path).status_code == 404
 
 
-def test_api_idempotency_and_start():
-    cluster = FakeCluster()
-    settings = Settings(namespace="images", argocd_application_name="llm-gateway")
-    endpoints = routes(create_app(cluster=cluster, settings=settings))
-    payload = ImageJobCreate(idempotencyKey="once", prompt="a small cat")
-    first = endpoints["/v1/images/jobs"](payload)
-    second = endpoints["/v1/images/jobs"](payload)
-    assert first["job_id"] == second["job_id"] == request_name("once")
-    assert len(cluster.requests) == 1
-    assert cluster.requests[("images", request_name("once"))]["spec"]["suspend"] is True
-    assert cluster.requests[("images", request_name("once"))]["metadata"]["annotations"] == {
-        "argocd.argoproj.io/tracking-id": (
-            f"llm-gateway:homelab.chik4ge.me/ImageGenerationRequest:images/"
-            f"{request_name('once')}"
-        ),
-        "argocd.argoproj.io/compare-options": "IgnoreExtraneous",
-        "argocd.argoproj.io/sync-options": "Prune=false",
-    }
+def test_openai_generations_preserves_upstream_contract_and_optimizer(monkeypatch):
+    cluster = ProxyingCluster()
+    forwarded = {}
 
-    with pytest.raises(Exception) as conflict:
-        endpoints["/v1/images/jobs"](
-            ImageJobCreate(idempotencyKey="once", prompt="a different prompt")
+    async def handle(request):
+        forwarded["url"] = str(request.url)
+        forwarded["body"] = await request.aread()
+        forwarded["authorization"] = request.headers.get("authorization")
+        forwarded["content_length"] = request.headers.get("content-length")
+        return httpx.Response(
+            201,
+            headers={"content-type": "application/json", "x-sd-server": "true"},
+            content=b'{"created":123,"data":[{"b64_json":"upstream"}]}',
         )
-    assert conflict.value.status_code == 409
 
-    started = endpoints["/v1/images/jobs/{job_id}/start"](request_name("once"))
-    assert started["spec"]["suspend"] is False
-
-
-def test_api_health_and_artifact_not_ready():
-    cluster = FakeCluster()
-    endpoints = routes(create_app(cluster=cluster, settings=Settings(namespace="images")))
-    assert endpoints["/healthz"]() == {"status": "ok"}
-    assert endpoints["/readyz"]() == {"status": "ready"}
-    with pytest.raises(Exception) as missing:
-        endpoints["/v1/images/jobs/{job_id}/artifact"]("missing")
-    assert missing.value.status_code == 404
-
-
-def test_api_response_models_serialize_crd_field_names():
-    cluster = FakeCluster()
-    client = TestClient(create_app(cluster=cluster, settings=Settings(namespace="images")))
-
-    response = client.post(
-        "/v1/images/jobs",
-        json={"idempotencyKey": "response-contract", "prompt": "a fox"},
+    monkeypatch.setattr(
+        "image_gateway.api._sd_client",
+        lambda timeout: httpx.AsyncClient(transport=httpx.MockTransport(handle)),
     )
-
-    assert response.status_code == 202
-    body = response.json()
-    assert body["spec"] == {
-        "idempotencyKey": "response-contract",
-        "prompt": "a fox",
-        "aspectRatio": "1:1",
-        "steps": 40,
-        "seed": 42,
-        "suspend": True,
-    }
-    assert body["phase"] == "Pending"
-
-
-def test_artifact_endpoint_returns_download_url():
-    cluster = FakeCluster()
-    cr = cluster.create_request(
-        "images",
-        {
-            "metadata": {"name": "igr-artifact"},
-            "spec": {
-                "idempotencyKey": "artifact",
-                "prompt": "a fox",
-                "suspend": False,
-            },
-        },
-    )
-    cluster.patch_request_status(
-        "images",
-        cr["metadata"]["name"],
-        {
-            "phase": "Succeeded",
-            "artifact": {
-                "key": "image-generation/igr-artifact.png",
-                "sha256": "0" * 64,
-                "contentType": "image/png",
-                "width": 1024,
-                "height": 1024,
-            },
-        },
-    )
-    client = TestClient(
-        create_app(
-            cluster=cluster,
-            settings=Settings(namespace="images", artifact_endpoint="http://objects"),
-        )
-    )
-    response = client.get("/v1/images/jobs/igr-artifact/artifact")
-    assert response.status_code == 200
-    assert response.json()["url"] == (
-        "http://objects/image-generation/igr-artifact.png"
-    )
-
-
-def test_openai_images_generations_uses_authenticated_standard_contract():
-    cluster = SucceededCluster()
     client = TestClient(
         create_app(
             cluster=cluster,
             settings=Settings(
                 namespace="images",
                 argocd_application_name="llm-gateway",
-                artifact_endpoint="https://objects.example",
                 llm_gateway_api_key="secret",
             ),
         )
@@ -150,77 +74,135 @@ def test_openai_images_generations_uses_authenticated_standard_contract():
         "/v1/images/generations",
         headers={"Authorization": "Bearer secret"},
         json={
-            "model": "dall-e-3",
+            "model": "image-model",
             "prompt": "a fox in a forest",
             "size": "1792x1024",
-            "response_format": "url",
-            "n": 1,
+            "n": 2,
+            "response_format": "b64_json",
+            "extra_upstream_field": {"preserve": True},
         },
     )
 
-    assert response.status_code == 200
-    body = response.json()
-    assert isinstance(body["created"], int)
-    assert body["data"] == [
-        {
-            "url": "https://objects.example/image-generation/generated.png",
-            "revised_prompt": "a carefully composed fox",
-        }
-    ]
+    assert response.status_code == 201
+    assert response.content == b'{"created":123,"data":[{"b64_json":"upstream"}]}'
+    assert response.headers["x-sd-server"] == "true"
+    assert forwarded["url"] == "http://10.0.0.9:8080/v1/images/generations"
+    assert forwarded["authorization"] is None
+    assert forwarded["content_length"] == str(len(forwarded["body"]))
+    assert json.loads(forwarded["body"]) == {
+        "model": "image-model",
+        "prompt": "an expanded prompt",
+        "size": "1792x1024",
+        "n": 2,
+        "response_format": "b64_json",
+        "extra_upstream_field": {"preserve": True},
+    }
     generated = next(iter(cluster.requests.values()))
-    assert generated["spec"]["aspectRatio"] == "16:9"
+    assert generated["spec"]["operation"] == "openai"
+    assert generated["spec"]["optimizePrompt"] is True
+    assert generated["spec"]["aspectRatio"] == "7:4"
     assert generated["spec"]["suspend"] is False
 
 
-def test_openai_images_generations_supports_base64_response(monkeypatch):
-    cluster = SucceededCluster()
+def test_openai_edits_streams_multipart_body_unchanged(monkeypatch):
+    cluster = ProxyingCluster()
+    multipart_body = (
+        b"--image-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n"
+        b"a cat\r\n--image-boundary--\r\n"
+    )
+    forwarded = {}
+
+    async def handle(request):
+        forwarded["body"] = await request.aread()
+        forwarded["content_type"] = request.headers["content-type"]
+        return httpx.Response(200, headers={"content-type": "image/png"}, content=b"png")
+
+    monkeypatch.setattr(
+        "image_gateway.api._sd_client",
+        lambda timeout: httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    )
     client = TestClient(
         create_app(
             cluster=cluster,
             settings=Settings(
-                namespace="images", llm_gateway_api_key="secret", artifact_endpoint="https://objects"
+                namespace="images",
+                llm_gateway_api_key="secret",
+                argocd_application_name="llm-gateway",
             ),
         )
     )
-    monkeypatch.setattr("image_gateway.api._download_image", lambda url: b"png-bytes")
 
     response = client.post(
-        "/v1/images/generations",
-        headers={"Authorization": "Bearer secret"},
-        json={"prompt": "a cat", "response_format": "b64_json"},
+        "/v1/images/edits",
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "multipart/form-data; boundary=image-boundary",
+        },
+        content=multipart_body,
     )
 
     assert response.status_code == 200
-    assert response.json()["data"][0]["b64_json"] == "cG5nLWJ5dGVz"
+    assert response.content == b"png"
+    assert response.headers["content-type"] == "image/png"
+    assert forwarded["body"] == multipart_body
+    assert forwarded["content_type"] == "multipart/form-data; boundary=image-boundary"
+    generated = next(iter(cluster.requests.values()))
+    assert generated["spec"]["operation"] == "openai"
+    assert generated["spec"]["optimizePrompt"] is False
+    assert "prompt" not in generated["spec"]
 
 
-@pytest.mark.parametrize(
-    ("headers", "payload", "status", "code"),
-    [
-        ({}, {"prompt": "a cat"}, 401, "invalid_api_key"),
-        (
-            {"Authorization": "Bearer secret"},
-            {"prompt": "a cat", "size": "auto"},
+def test_generation_validation_is_delegated_to_stable_diffusion_server(monkeypatch):
+    cluster = ProxyingCluster()
+    raw_body = b"{invalid json"
+    forwarded = []
+
+    async def handle(request):
+        forwarded.append(await request.aread())
+        return httpx.Response(
             400,
-            "invalid_request",
-        ),
-        (
-            {"Authorization": "Bearer secret"},
-            {"prompt": "a cat", "n": 2},
-            400,
-            "invalid_request",
-        ),
-    ],
-)
-def test_openai_images_generations_uses_openai_error_shape(headers, payload, status, code):
+            headers={"content-type": "application/json"},
+            content=b'{"error":{"message":"invalid request"}}',
+        )
+
+    monkeypatch.setattr(
+        "image_gateway.api._sd_client",
+        lambda timeout: httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    )
     client = TestClient(
         create_app(
-            cluster=SucceededCluster(),
+            cluster=cluster,
             settings=Settings(namespace="images", llm_gateway_api_key="secret"),
         )
     )
 
-    response = client.post("/v1/images/generations", headers=headers, json=payload)
+    response = client.post(
+        "/v1/images/generations",
+        headers={"Authorization": "Bearer secret"},
+        content=raw_body,
+    )
+
+    assert response.status_code == 400
+    assert response.content == b'{"error":{"message":"invalid request"}}'
+    assert forwarded == [raw_body]
+
+
+@pytest.mark.parametrize(
+    ("headers", "status", "code"),
+    [
+        ({}, 401, "invalid_api_key"),
+        ({"Authorization": "Bearer wrong"}, 401, "invalid_api_key"),
+    ],
+)
+def test_openai_authentication_errors(headers, status, code):
+    client = TestClient(
+        create_app(
+            cluster=ProxyingCluster(),
+            settings=Settings(namespace="images", llm_gateway_api_key="secret"),
+        )
+    )
+
+    response = client.post("/v1/images/generations", headers=headers, json={"prompt": "a cat"})
 
     assert response.status_code == status
     assert response.json()["error"]["code"] == code

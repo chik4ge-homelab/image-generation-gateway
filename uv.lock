@@ -485,6 +485,7 @@ source = { editable = "." }
 dependencies = [
     { name = "boto3" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "kubernetes" },
     { name = "pydantic" },
     { name = "uvicorn", extra = ["standard"] },
@@ -492,7 +493,6 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -502,7 +502,7 @@ dev = [
 requires-dist = [
     { name = "boto3", specifier = ">=1.35,<2" },
     { name = "fastapi", specifier = ">=0.115,<1" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27,<1" },
+    { name = "httpx", specifier = ">=0.27,<1" },
     { name = "kubernetes", specifier = ">=31,<34" },
     { name = "pydantic", specifier = ">=2.7,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<9" },

@@ -10,6 +10,7 @@ from .config import Settings
 from .manifests import (
     DIFFUSER_CRONJOB_NAME,
     OPTIMIZER_CRONJOB_NAME,
+    SERVER_CRONJOB_NAME,
     diffuser_configmap,
     job_from_cronjob,
     optimizer_configmap,
@@ -20,6 +21,7 @@ from .naming import (
     diffuser_job_name,
     optimizer_configmap_name,
     optimizer_job_name,
+    server_job_name,
 )
 from .validation import StrictJSONError, parse_artifact_output, parse_optimizer_output
 
@@ -97,6 +99,12 @@ class Controller:
             self._optimizing(cr)
         elif phase == "Generating":
             self._generating(cr)
+        elif phase == "Prepared":
+            self._prepared(cr)
+        elif phase == "StartingServer":
+            self._starting_server(cr)
+        elif phase == "Proxying":
+            self._proxying(cr)
         elif phase == "RestoringText":
             self._restoring_text(cr)
 
@@ -108,7 +116,13 @@ class Controller:
             if self.cluster.llm_pods_gone(
                 self.settings.llm_namespace, self.settings.llm_deployment_name
             ):
-                self._patch_phase(cr, "Optimizing")
+                next_phase = (
+                    "Prepared"
+                    if cr.get("spec", {}).get("operation") == "openai"
+                    and not cr.get("spec", {}).get("optimizePrompt", False)
+                    else "Optimizing"
+                )
+                self._patch_phase(cr, next_phase)
             elif self._phase_timed_out(cr):
                 self._fail(
                     cr,
@@ -140,11 +154,14 @@ class Controller:
                 self._fail(cr, "Optimizing", "OptimizerOutputMissing", "optimizer output was empty")
                 return
             result = parse_optimizer_output(output)
+            next_phase = (
+                "Prepared" if cr.get("spec", {}).get("operation") == "openai" else "Generating"
+            )
             self.cluster.patch_request_status(
                 self.settings.namespace,
                 name,
                 {
-                    "phase": "Generating",
+                    "phase": next_phase,
                     "optimizer": {
                         "rewrittenPrompt": result.rewritten_prompt,
                         "whRatio": result.wh_ratio,
@@ -155,6 +172,120 @@ class Controller:
             self._fail(cr, "Optimizing", "InvalidOptimizerOutput", str(exc))
         except Exception as exc:
             self._fail(cr, "Optimizing", "OptimizerReconcileFailed", str(exc))
+
+    def _prepared(self, cr: dict[str, Any]) -> None:
+        requests = sorted(
+            self.cluster.list_requests(self.settings.namespace),
+            key=lambda item: (
+                item.get("metadata", {}).get("creationTimestamp", ""),
+                item["metadata"]["name"],
+            ),
+        )
+        optimizing = next(
+            (
+                item
+                for item in requests
+                if item.get("spec", {}).get("operation") == "openai"
+                and item.get("status", {}).get("phase") == "Optimizing"
+            ),
+            None,
+        )
+        if optimizing:
+            self._optimizing(optimizing)
+            return
+        queued = next(
+            (
+                item
+                for item in requests
+                if item.get("status", {}).get("phase", "Pending") == "Pending"
+                and not item.get("spec", {}).get("suspend", True)
+            ),
+            None,
+        )
+        if queued and queued.get("spec", {}).get("operation") == "openai":
+            if queued.get("spec", {}).get("optimizePrompt", False):
+                try:
+                    self.cluster.patch_request_status(
+                        self.settings.namespace,
+                        queued["metadata"]["name"],
+                        {"phase": "Optimizing", "startedAt": self._now()},
+                        resource_version=queued.get("metadata", {}).get("resourceVersion"),
+                    )
+                except ConflictError:
+                    return
+                self._optimizing(
+                    self.cluster.get_request(
+                        self.settings.namespace, queued["metadata"]["name"]
+                    )
+                )
+            else:
+                try:
+                    self.cluster.patch_request_status(
+                        self.settings.namespace,
+                        queued["metadata"]["name"],
+                        {"phase": "Prepared", "startedAt": self._now()},
+                        resource_version=queued.get("metadata", {}).get("resourceVersion"),
+                    )
+                except ConflictError:
+                    return
+            return
+        self._patch_phase(cr, "StartingServer")
+
+    def _starting_server(self, cr: dict[str, Any]) -> None:
+        name = cr["metadata"]["name"]
+        try:
+            job_name = server_job_name(cr["metadata"]["uid"])
+            job = self._ensure_template_job(cr, SERVER_CRONJOB_NAME, job_name, None)
+            outcome = self._job_outcome(job)
+            if outcome in {"failed", "succeeded"}:
+                self._fail(
+                    cr,
+                    "StartingServer",
+                    "StableDiffusionServerJobFailed",
+                    "stable-diffusion.cpp server Job exited before serving requests",
+                )
+                return
+            endpoint = self.cluster.job_endpoint(self.settings.namespace, job_name, 8080)
+            if not endpoint:
+                return
+            self.cluster.patch_request_status(
+                self.settings.namespace,
+                name,
+                {"phase": "Proxying", "serverJobName": job_name, "serverUrl": endpoint},
+            )
+        except Exception as exc:
+            self._fail(cr, "StartingServer", "ServerStartupFailed", str(exc))
+
+    def _proxying(self, cr: dict[str, Any]) -> None:
+        status = cr.get("status", {})
+        job_name = status.get("serverJobName")
+        if not job_name:
+            self._fail(
+                cr, "Proxying", "ServerStateMissing", "stable-diffusion.cpp Job name is missing"
+            )
+            return
+        try:
+            job = self.cluster.get_job(self.settings.namespace, job_name)
+            if self._job_outcome(job) in {"failed", "succeeded"}:
+                self._fail(
+                    cr,
+                    "Proxying",
+                    "StableDiffusionServerExited",
+                    "stable-diffusion.cpp server exited while serving requests",
+                )
+            elif self._request_timed_out(cr):
+                self._fail(
+                    cr,
+                    "Proxying",
+                    "ImageGenerationTimeout",
+                    "image generation request exceeded its timeout",
+                )
+        except NotFoundError:
+            self._fail(
+                cr, "Proxying", "ServerJobMissing", "stable-diffusion.cpp server Job disappeared"
+            )
+        except Exception as exc:
+            self._fail(cr, "Proxying", "ServerStateReadFailed", str(exc))
 
     def _generating(self, cr: dict[str, Any]) -> None:
         name = cr["metadata"]["name"]
@@ -214,6 +345,25 @@ class Controller:
 
     def _restoring_text(self, cr: dict[str, Any]) -> None:
         try:
+            status = cr.get("status", {})
+            server_job = status.get("serverJobName")
+            if server_job:
+                if self._shared_server_in_use(cr, server_job):
+                    self._patch_phase(cr, "Succeeded")
+                    return
+                if not status.get("serverClosing"):
+                    if self._advance_proxy_queue(cr):
+                        return
+                    self.cluster.patch_request_status(
+                        self.settings.namespace,
+                        cr["metadata"]["name"],
+                        {"serverClosing": True},
+                    )
+                self.cluster.delete_job(self.settings.namespace, server_job)
+                if not self.cluster.job_pods_gone(self.settings.namespace, server_job):
+                    return
+            elif self._advance_proxy_queue(cr):
+                return
             self.cluster.llm_scale(
                 self.settings.llm_namespace, self.settings.llm_deployment_name, 1
             )
@@ -230,6 +380,57 @@ class Controller:
         except Exception as exc:
             self._fail(cr, "RestoringText", "LlmRestoreFailed", str(exc))
 
+    def _advance_proxy_queue(self, cr: dict[str, Any]) -> bool:
+        status = cr.get("status", {})
+        server_url = status.get("serverUrl")
+        server_job = status.get("serverJobName")
+        if cr.get("spec", {}).get("operation") != "openai" or not server_url or not server_job:
+            return False
+        requests = sorted(
+            self.cluster.list_requests(self.settings.namespace),
+            key=lambda item: (
+                item.get("metadata", {}).get("creationTimestamp", ""),
+                item["metadata"]["name"],
+            ),
+        )
+        queued = next(
+            (
+                item
+                for item in requests
+                if item.get("status", {}).get("phase", "Pending") in {"Pending", "Prepared"}
+                and not item.get("spec", {}).get("suspend", True)
+            ),
+            None,
+        )
+        if not queued or queued.get("spec", {}).get("operation") != "openai":
+            return False
+        queued_phase = queued.get("status", {}).get("phase", "Pending")
+        if queued_phase == "Pending" and queued.get("spec", {}).get("optimizePrompt", False):
+            return False
+        next_status: dict[str, Any] = {
+            "phase": "Proxying",
+            "startedAt": self._now(),
+            "serverJobName": server_job,
+            "serverUrl": server_url,
+        }
+        self.cluster.patch_request_status(
+            self.settings.namespace, queued["metadata"]["name"], next_status
+        )
+        self.cluster.patch_request_status(
+            self.settings.namespace,
+            cr["metadata"]["name"],
+            {"phase": "Succeeded", "completedAt": self._now()},
+        )
+        return True
+
+    def _shared_server_in_use(self, cr: dict[str, Any], server_job: str) -> bool:
+        return any(
+            request["metadata"]["name"] != cr["metadata"]["name"]
+            and request.get("status", {}).get("phase") == "Proxying"
+            and request.get("status", {}).get("serverJobName") == server_job
+            for request in self.cluster.list_requests(self.settings.namespace)
+        )
+
     def _ensure_configmap(self, manifest: dict[str, Any], name: str) -> None:
         try:
             self.cluster.get_configmap(self.settings.namespace, name)
@@ -240,7 +441,7 @@ class Controller:
                 pass
 
     def _ensure_template_job(
-        self, cr: dict[str, Any], cronjob_name: str, name: str, configmap_name: str
+        self, cr: dict[str, Any], cronjob_name: str, name: str, configmap_name: str | None
     ) -> dict[str, Any]:
         try:
             return self.cluster.get_job(self.settings.namespace, name)
@@ -290,27 +491,50 @@ class Controller:
         elapsed = (datetime.now(UTC) - started).total_seconds()
         return elapsed >= self.settings.llm_stop_timeout_seconds
 
+    def _request_timed_out(self, cr: dict[str, Any]) -> bool:
+        started_at = cr.get("status", {}).get("startedAt")
+        if not started_at:
+            return False
+        try:
+            started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        elapsed = (datetime.now(UTC) - started).total_seconds()
+        return elapsed >= self.settings.image_generation_timeout_seconds
+
     def _fail(self, cr: dict[str, Any], stage: str, reason: str, message: str) -> None:
         conditions: list[dict[str, Any]] = []
+        keep_llm_stopped = False
         try:
-            self.cluster.llm_scale(
-                self.settings.llm_namespace, self.settings.llm_deployment_name, 1
+            server_job = cr.get("status", {}).get("serverJobName")
+            if server_job:
+                self.cluster.delete_job(self.settings.namespace, server_job)
+                self.cluster.wait_job_pods_gone(self.settings.namespace, server_job, 120)
+            keep_llm_stopped = any(
+                request["metadata"]["name"] != cr["metadata"]["name"]
+                and request.get("spec", {}).get("operation") == "openai"
+                and request.get("status", {}).get("phase") in {"Prepared", "StartingServer"}
+                for request in self.cluster.list_requests(self.settings.namespace)
             )
-            ready = self.cluster.wait_llm_ready(
-                self.settings.llm_namespace,
-                self.settings.llm_deployment_name,
-                self.settings.llm_restore_timeout_seconds,
-            )
-            if not ready:
-                conditions.append(
-                    {
-                        "type": "LlmRestorationFailed",
-                        "status": "True",
-                        "reason": "ReadinessTimeout",
-                        "message": "llama-cpp did not become ready after failure",
-                        "lastTransitionTime": self._now(),
-                    }
+            if not keep_llm_stopped:
+                self.cluster.llm_scale(
+                    self.settings.llm_namespace, self.settings.llm_deployment_name, 1
                 )
+                ready = self.cluster.wait_llm_ready(
+                    self.settings.llm_namespace,
+                    self.settings.llm_deployment_name,
+                    self.settings.llm_restore_timeout_seconds,
+                )
+                if not ready:
+                    conditions.append(
+                        {
+                            "type": "LlmRestorationFailed",
+                            "status": "True",
+                            "reason": "ReadinessTimeout",
+                            "message": "llama-cpp did not become ready after failure",
+                            "lastTransitionTime": self._now(),
+                        }
+                    )
         except Exception as exc:
             conditions.append(
                 {

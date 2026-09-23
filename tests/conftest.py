@@ -15,9 +15,12 @@ class FakeCluster:
         self.cronjobs = {
             ("images", "image-generation-optimizer"): make_cronjob_template("optimizer"),
             ("images", "image-generation-diffuser"): make_cronjob_template("diffuser"),
+            ("images", "image-generation-server"): make_cronjob_template("server"),
         }
         self.outputs = {}
         self.scales = []
+        self.deleted_jobs = set()
+        self.job_endpoints = {}
         self.pods_gone = True
         self.uid = "12345678-1234-1234-1234-123456789abc"
         self._rv = 1
@@ -103,6 +106,18 @@ class FakeCluster:
         self.jobs[key] = result
         return copy.deepcopy(result)
 
+    def delete_job(self, namespace, name):
+        self.deleted_jobs.add((namespace, name))
+
+    def job_pods_gone(self, namespace, job_name):
+        return (namespace, job_name) in self.deleted_jobs
+
+    def wait_job_pods_gone(self, namespace, job_name, timeout_seconds):
+        return self.job_pods_gone(namespace, job_name)
+
+    def job_endpoint(self, namespace, job_name, port):
+        return self.job_endpoints.get((namespace, job_name))
+
     def get_cronjob(self, namespace, name):
         try:
             return copy.deepcopy(self.cronjobs[(namespace, name)])
@@ -152,6 +167,50 @@ def make_cr(name="igr-test"):
 
 def make_cronjob_template(worker):
     is_optimizer = worker == "optimizer"
+    is_server = worker == "server"
+    volumes = [
+        {
+            "name": "models",
+            "persistentVolumeClaim": {"claimName": "image-generation-models"},
+        }
+    ]
+    if not is_server:
+        volumes.insert(
+            0,
+            {
+                "name": "input",
+                "configMap": {
+                    "name": f"image-generation-{worker}-input-template",
+                    "items": [{"key": "input.json", "path": "input.json"}],
+                },
+            },
+        )
+    container = {
+        "name": worker,
+        "image": f"{worker}:test",
+        "args": ["--input", "/inputs/input.json"] if not is_server else ["--listen-port", "8080"],
+        "env": [{"name": "MODEL_PATH", "value": "/models/model.gguf"}],
+        "resources": {
+            "requests": {
+                "memory": "4Gi" if is_optimizer else "6Gi",
+                "nvidia.com/gpu": "1",
+            },
+            "limits": {
+                "memory": "4Gi" if is_optimizer else "12Gi",
+                "nvidia.com/gpu": "1",
+            },
+        },
+        "volumeMounts": [
+            *(
+                [{"name": "input", "mountPath": "/inputs", "readOnly": True}]
+                if not is_server
+                else []
+            ),
+            {"name": "models", "mountPath": "/models", "readOnly": True},
+        ],
+    }
+    if not is_optimizer:
+        container["envFrom"] = [{"secretRef": {"name": "artifacts"}}]
     return {
         "apiVersion": "batch/v1",
         "kind": "CronJob",
@@ -170,52 +229,8 @@ def make_cronjob_template(worker):
                             "restartPolicy": "Never",
                             "serviceAccountName": "image-generation-job",
                             "runtimeClassName": "nvidia",
-                            "containers": [
-                                {
-                                    "name": worker,
-                                    "image": f"{worker}:test",
-                                    "args": ["--input", "/inputs/input.json"],
-                                    "env": [{"name": "MODEL_PATH", "value": "/models/model.gguf"}],
-                                    "resources": {
-                                        "requests": {
-                                            "memory": "4Gi" if is_optimizer else "6Gi",
-                                            "nvidia.com/gpu": "1",
-                                        },
-                                        "limits": {
-                                            "memory": "4Gi" if is_optimizer else "12Gi",
-                                            "nvidia.com/gpu": "1",
-                                        },
-                                    },
-                                    "volumeMounts": [
-                                        {"name": "input", "mountPath": "/inputs", "readOnly": True},
-                                        {
-                                            "name": "models",
-                                            "mountPath": "/models",
-                                            "readOnly": True,
-                                        },
-                                    ],
-                                    **(
-                                        {"envFrom": [{"secretRef": {"name": "artifacts"}}]}
-                                        if not is_optimizer
-                                        else {}
-                                    ),
-                                }
-                            ],
-                            "volumes": [
-                                {
-                                    "name": "input",
-                                    "configMap": {
-                                        "name": f"image-generation-{worker}-input-template",
-                                        "items": [{"key": "input.json", "path": "input.json"}],
-                                    },
-                                },
-                                {
-                                    "name": "models",
-                                    "persistentVolumeClaim": {
-                                        "claimName": "image-generation-models"
-                                    },
-                                },
-                            ],
+                                    "containers": [container],
+                                    "volumes": volumes,
                         },
                     },
                 },

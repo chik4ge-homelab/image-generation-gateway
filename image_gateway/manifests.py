@@ -16,6 +16,7 @@ VERSION = "v1alpha1"
 KIND = "ImageGenerationRequest"
 OPTIMIZER_CRONJOB_NAME = "image-generation-optimizer"
 DIFFUSER_CRONJOB_NAME = "image-generation-diffuser"
+SERVER_CRONJOB_NAME = "image-generation-server"
 
 
 def owner_reference(cr: dict[str, Any]) -> dict[str, Any]:
@@ -99,7 +100,7 @@ def job_from_cronjob(
     cronjob: dict[str, Any],
     *,
     name: str,
-    configmap_name: str,
+    configmap_name: str | None,
 ) -> dict[str, Any]:
     cronjob_spec = cronjob.get("spec", {})
     if cronjob_spec.get("suspend") is not True:
@@ -118,10 +119,15 @@ def job_from_cronjob(
         ),
         None,
     )
-    if input_volume is None:
+    if configmap_name is None:
+        if input_volume is not None:
+            template_name = cronjob.get("metadata", {}).get("name")
+            raise ValueError(f"CronJob template {template_name} unexpectedly has an input volume")
+    elif input_volume is None:
         template_name = cronjob.get("metadata", {}).get("name")
         raise ValueError(f"CronJob template {template_name} has no input volume")
-    input_volume["configMap"]["name"] = configmap_name
+    else:
+        input_volume["configMap"]["name"] = configmap_name
 
     labels = deepcopy(job_template.get("metadata", {}).get("labels", {}))
     labels.update({"app.kubernetes.io/part-of": "image-generation", "image-job": name})

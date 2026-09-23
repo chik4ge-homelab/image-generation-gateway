@@ -1,50 +1,23 @@
 from __future__ import annotations
 
-import base64
+import asyncio
 import hmac
+import json
+import math
 import time
 from typing import Any
-from urllib.request import Request, urlopen
 from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi import Request as FastAPIRequest
-from fastapi.exception_handlers import request_validation_exception_handler
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .argocd import tracking_annotations
-from .cluster import ClusterError, ConflictError, KubernetesCluster, NotFoundError
+from .cluster import ClusterError, KubernetesCluster
 from .config import Settings
-from .models import (
-    OPENAI_SIZE_RATIOS,
-    ArtifactResponse,
-    ImageJobCreate,
-    ImageJobResponse,
-    OpenAIImageGenerationRequest,
-    ProbeResponse,
-)
+from .models import ProbeResponse
 from .naming import request_name
-
-
-def _not_found() -> HTTPException:
-    return HTTPException(status_code=404, detail="image generation request not found")
-
-
-def _job_response(cr: dict[str, Any]) -> dict[str, Any]:
-    metadata = cr.get("metadata", {})
-    status = cr.get("status", {})
-    spec = cr.get("spec", {})
-    response: dict[str, Any] = {
-        "job_id": metadata.get("name"),
-        "name": metadata.get("name"),
-        "phase": status.get("phase", "Pending"),
-        "spec": spec,
-    }
-    for key in ("optimizer", "artifact", "failure", "conditions"):
-        if key in status:
-            response[key] = status[key]
-    return response
 
 
 def _openai_error(
@@ -53,7 +26,6 @@ def _openai_error(
     error_type: str,
     code: str,
     status_code: int,
-    param: str | None = None,
     headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     return JSONResponse(
@@ -63,44 +35,94 @@ def _openai_error(
             "error": {
                 "message": message,
                 "type": error_type,
-                "param": param,
+                "param": None,
                 "code": code,
             }
         },
     )
 
 
-def _download_image(url: str) -> bytes:
-    request = Request(url, method="GET")
-    with urlopen(request, timeout=120) as response:
-        payload = response.read(256 * 1024 * 1024 + 1)
-    if len(payload) > 256 * 1024 * 1024:
-        raise ValueError("generated image exceeds the response size limit")
-    return payload
+def _request_prompt(raw_body: bytes) -> tuple[str | None, str]:
+    try:
+        payload = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "1:1"
+    if not isinstance(payload, dict):
+        return None, "1:1"
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8192:
+        return None, "1:1"
+    ratio = "1:1"
+    size = payload.get("size")
+    if isinstance(size, str) and "x" in size:
+        try:
+            width, height = (int(part) for part in size.lower().split("x", 1))
+            if width > 0 and height > 0:
+                divisor = math.gcd(width, height)
+                ratio = f"{width // divisor}:{height // divisor}"
+        except ValueError:
+            pass
+    return prompt, ratio if len(ratio) <= 16 else "1:1"
+
+
+def _optimized_body(raw_body: bytes, status: dict[str, Any]) -> bytes:
+    rewritten_prompt = status.get("optimizer", {}).get("rewrittenPrompt")
+    if not rewritten_prompt:
+        return raw_body
+    try:
+        payload = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return raw_body
+    if not isinstance(payload, dict) or not isinstance(payload.get("prompt"), str):
+        return raw_body
+    payload["prompt"] = rewritten_prompt
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _forward_request_headers(request: FastAPIRequest) -> dict[str, str]:
+    allowed = {
+        "content-type",
+        "content-encoding",
+        "accept",
+        "accept-encoding",
+    }
+    return {key: value for key, value in request.headers.items() if key.lower() in allowed}
+
+
+def _response_headers(headers: httpx.Headers) -> dict[str, str]:
+    hop_by_hop = {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+    connection_tokens = {
+        token.strip().lower()
+        for token in headers.get("connection", "").split(",")
+        if token.strip()
+    }
+    blocked = hop_by_hop | connection_tokens
+    return {key: value for key, value in headers.items() if key.lower() not in blocked}
+
+
+def _sd_client(timeout_seconds: int) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
 
 
 def create_app(*, cluster: Any | None = None, settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     cluster = cluster or KubernetesCluster()
-    app = FastAPI(title="image-generation-gateway", version="0.1.0")
-
-    @app.exception_handler(RequestValidationError)
-    async def validation_error(
-        request: FastAPIRequest, exc: RequestValidationError
-    ) -> JSONResponse:
-        if request.url.path != "/v1/images/generations":
-            return await request_validation_exception_handler(request, exc)
-        first_error = exc.errors()[0] if exc.errors() else {}
-        location = first_error.get("loc", ())
-        param = str(location[-1]) if location and location[-1] != "body" else None
-        message = first_error.get("msg", "invalid request")
-        return _openai_error(
-            message,
-            error_type="invalid_request_error",
-            code="invalid_request",
-            status_code=400,
-            param=param,
-        )
+    app = FastAPI(
+        title="image-generation-gateway",
+        version="0.1.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
 
     @app.get("/healthz", response_model=ProbeResponse)
     def healthz() -> dict[str, str]:
@@ -111,16 +133,14 @@ def create_app(*, cluster: Any | None = None, settings: Settings | None = None) 
         try:
             ready = bool(cluster.ready())
         except Exception as exc:
-            raise HTTPException(status_code=503, detail="kubernetes client is not ready") from exc
+            raise HTTPException(status_code=503, detail="Kubernetes client is not ready") from exc
         if not ready:
-            raise HTTPException(status_code=503, detail="kubernetes client is not ready")
+            raise HTTPException(status_code=503, detail="Kubernetes client is not ready")
         return {"status": "ready"}
 
     @app.post("/v1/images/generations")
-    def generate_image(
-        request: OpenAIImageGenerationRequest,
-        http_request: FastAPIRequest,
-    ) -> JSONResponse:
+    @app.post("/v1/images/edits")
+    async def proxy_openai_images(http_request: FastAPIRequest) -> Any:
         if not settings.llm_gateway_api_key:
             return _openai_error(
                 "image generation authentication is not configured",
@@ -143,13 +163,19 @@ def create_app(*, cluster: Any | None = None, settings: Settings | None = None) 
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        request_id = f"hermes-{uuid4()}"
-        job = ImageJobCreate(
-            idempotencyKey=request_id,
-            prompt=request.prompt,
-            aspectRatio=OPENAI_SIZE_RATIOS[request.size],
-        )
+        is_generation = http_request.url.path.endswith("/generations")
+        raw_body = await http_request.body() if is_generation else None
+        prompt, aspect_ratio = _request_prompt(raw_body) if raw_body is not None else (None, "1:1")
+        request_id = f"openai-{uuid4()}"
         name = request_name(request_id)
+        spec: dict[str, Any] = {
+            "idempotencyKey": request_id,
+            "operation": "openai",
+            "optimizePrompt": prompt is not None,
+            "suspend": False,
+        }
+        if prompt is not None:
+            spec.update({"prompt": prompt, "aspectRatio": aspect_ratio})
         body = {
             "apiVersion": "homelab.chik4ge.me/v1alpha1",
             "kind": "ImageGenerationRequest",
@@ -165,11 +191,10 @@ def create_app(*, cluster: Any | None = None, settings: Settings | None = None) 
                     name=name,
                 ),
             },
-            "spec": {**job.model_dump(by_alias=True), "suspend": False},
+            "spec": spec,
         }
-
         try:
-            cluster.create_request(settings.namespace, body)
+            await asyncio.to_thread(cluster.create_request, settings.namespace, body)
         except ClusterError:
             return _openai_error(
                 "image generation request could not be created",
@@ -179,156 +204,98 @@ def create_app(*, cluster: Any | None = None, settings: Settings | None = None) 
             )
 
         deadline = time.monotonic() + settings.image_generation_timeout_seconds
-        while True:
-            try:
-                cr = cluster.get_request(settings.namespace, name)
-            except ClusterError:
-                return _openai_error(
-                    "image generation request could not be read",
-                    error_type="server_error",
-                    code="request_read_failed",
-                    status_code=503,
-                )
-            status = cr.get("status", {})
-            phase = status.get("phase", "Pending")
-            if phase == "Failed":
-                return _openai_error(
-                    "image generation failed",
-                    error_type="server_error",
-                    code="image_generation_failed",
-                    status_code=500,
-                )
-            if phase == "Succeeded":
-                artifact = status.get("artifact")
-                if not artifact:
+        try:
+            while True:
+                cr = await asyncio.to_thread(cluster.get_request, settings.namespace, name)
+                status = cr.get("status", {})
+                phase = status.get("phase", "Pending")
+                if phase == "Proxying" and status.get("serverUrl"):
+                    break
+                if phase == "Failed":
+                    failure = status.get("failure", {})
                     return _openai_error(
-                        "image generation completed without an artifact",
+                        failure.get("message", "image generation failed"),
                         error_type="server_error",
-                        code="artifact_missing",
+                        code="image_generation_failed",
                         status_code=500,
                     )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    await asyncio.to_thread(
+                        cluster.patch_request_status,
+                        settings.namespace,
+                        name,
+                        {"phase": "RestoringText"},
+                    )
+                    return _openai_error(
+                        "image generation timed out",
+                        error_type="server_error",
+                        code="image_generation_timeout",
+                        status_code=504,
+                    )
+                await asyncio.sleep(min(settings.api_poll_interval_seconds, remaining))
+        except ClusterError:
+            return _openai_error(
+                "image generation request could not be read",
+                error_type="server_error",
+                code="request_read_failed",
+                status_code=503,
+            )
+
+        content: bytes | Any = (
+            _optimized_body(raw_body, status) if raw_body is not None else http_request.stream()
+        )
+        target = status["serverUrl"].rstrip("/") + http_request.url.path
+        if http_request.url.query:
+            target += "?" + http_request.url.query
+        client = _sd_client(settings.image_generation_timeout_seconds)
+        try:
+            upstream_request = client.build_request(
+                "POST",
+                target,
+                headers=_forward_request_headers(http_request),
+                content=content,
+            )
+            upstream = await client.send(upstream_request, stream=True)
+        except Exception:
+            await client.aclose()
+            await asyncio.to_thread(
+                cluster.patch_request_status,
+                settings.namespace,
+                name,
+                {"phase": "RestoringText"},
+            )
+            return _openai_error(
+                "stable-diffusion.cpp request failed",
+                error_type="server_error",
+                code="image_generation_failed",
+                status_code=502,
+            )
+
+        async def response_stream():
+            try:
+                if upstream.is_stream_consumed:
+                    yield upstream.content
+                else:
+                    async for chunk in upstream.aiter_raw():
+                        yield chunk
+            finally:
+                await upstream.aclose()
+                await client.aclose()
                 try:
-                    artifact_url = cluster.artifact_url(settings.artifact_endpoint, artifact)
-                    image_data: dict[str, str]
-                    if request.response_format == "url":
-                        image_data = {"url": artifact_url}
-                    else:
-                        encoded = base64.b64encode(_download_image(artifact_url)).decode("ascii")
-                        image_data = {"b64_json": encoded}
+                    await asyncio.to_thread(
+                        cluster.patch_request_status,
+                        settings.namespace,
+                        name,
+                        {"phase": "RestoringText"},
+                    )
                 except Exception:
-                    return _openai_error(
-                        "generated image could not be retrieved",
-                        error_type="server_error",
-                        code="artifact_retrieval_failed",
-                        status_code=500,
-                    )
-                revised_prompt = status.get("optimizer", {}).get("rewrittenPrompt")
-                if revised_prompt:
-                    image_data["revised_prompt"] = revised_prompt
-                return JSONResponse(
-                    content={"created": int(time.time()), "data": [image_data]}
-                )
+                    pass
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return _openai_error(
-                    "image generation timed out",
-                    error_type="server_error",
-                    code="image_generation_timeout",
-                    status_code=504,
-                )
-            time.sleep(min(settings.api_poll_interval_seconds, remaining))
-
-    @app.post("/v1/images/jobs", status_code=202, response_model=ImageJobResponse)
-    def create_job(request: ImageJobCreate) -> dict[str, Any]:
-        name = request_name(request.idempotency_key)
-        body = {
-            "apiVersion": "homelab.chik4ge.me/v1alpha1",
-            "kind": "ImageGenerationRequest",
-            "metadata": {
-                "name": name,
-                "namespace": settings.namespace,
-                "labels": {"app.kubernetes.io/part-of": "image-generation"},
-                "annotations": tracking_annotations(
-                    settings.argocd_application_name,
-                    group="homelab.chik4ge.me",
-                    kind="ImageGenerationRequest",
-                    namespace=settings.namespace,
-                    name=name,
-                ),
-            },
-            "spec": {
-                **request.model_dump(by_alias=True),
-                "suspend": True,
-            },
-        }
-        try:
-            cr = cluster.create_request(settings.namespace, body)
-            return _job_response(cr)
-        except ConflictError:
-            try:
-                existing = cluster.get_request(settings.namespace, name)
-                existing_spec = existing.get("spec", {})
-                requested_spec = body["spec"]
-                comparable_fields = (
-                    "idempotencyKey",
-                    "prompt",
-                    "aspectRatio",
-                    "steps",
-                    "seed",
-                )
-                if any(
-                    existing_spec.get(field) != requested_spec.get(field)
-                    for field in comparable_fields
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="idempotency key is already used for a different request",
-                    )
-                return _job_response(existing)
-            except NotFoundError as exc:
-                raise HTTPException(status_code=409, detail="request creation conflicted") from exc
-        except ClusterError as exc:
-            raise HTTPException(status_code=503, detail="kubernetes request failed") from exc
-
-    @app.get("/v1/images/jobs/{job_id}", response_model=ImageJobResponse)
-    def get_job(job_id: str) -> dict[str, Any]:
-        try:
-            return _job_response(cluster.get_request(settings.namespace, job_id))
-        except NotFoundError as exc:
-            raise _not_found() from exc
-        except ClusterError as exc:
-            raise HTTPException(status_code=503, detail="kubernetes request failed") from exc
-
-    @app.post("/v1/images/jobs/{job_id}/start", response_model=ImageJobResponse)
-    def start_job(job_id: str) -> dict[str, Any]:
-        try:
-            current = cluster.get_request(settings.namespace, job_id)
-            if current.get("status", {}).get("phase") in {"Succeeded", "Failed"}:
-                raise HTTPException(status_code=409, detail="job is terminal")
-            cr = cluster.patch_request(settings.namespace, job_id, {"spec": {"suspend": False}})
-            return _job_response(cr)
-        except NotFoundError as exc:
-            raise _not_found() from exc
-        except HTTPException:
-            raise
-        except ClusterError as exc:
-            raise HTTPException(status_code=503, detail="kubernetes request failed") from exc
-
-    @app.get("/v1/images/jobs/{job_id}/artifact", response_model=ArtifactResponse)
-    def get_artifact(job_id: str) -> dict[str, Any]:
-        try:
-            cr = cluster.get_request(settings.namespace, job_id)
-        except NotFoundError as exc:
-            raise _not_found() from exc
-        except ClusterError as exc:
-            raise HTTPException(status_code=503, detail="kubernetes request failed") from exc
-        artifact = cr.get("status", {}).get("artifact")
-        if cr.get("status", {}).get("phase") != "Succeeded" or not artifact:
-            raise HTTPException(status_code=404, detail="artifact is not ready")
-        result = {"job_id": job_id, "artifact": artifact}
-        if settings.artifact_endpoint and artifact.get("key"):
-            result["url"] = cluster.artifact_url(settings.artifact_endpoint, artifact)
-        return result
+        return StreamingResponse(
+            response_stream(),
+            status_code=upstream.status_code,
+            headers=_response_headers(upstream.headers),
+        )
 
     return app

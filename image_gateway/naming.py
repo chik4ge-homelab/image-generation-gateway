@@ -24,6 +24,10 @@ def diffuser_job_name(uid: str) -> str:
     return uid_name("igr-diff", uid)
 
 
+def server_job_name(uid: str) -> str:
+    return uid_name("igr-server", uid)
+
+
 def optimizer_configmap_name(uid: str) -> str:
     return uid_name("igr-opt-input", uid)
 

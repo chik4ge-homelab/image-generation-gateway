@@ -147,6 +147,56 @@ class KubernetesCluster:
         except Exception as exc:
             raise self._api_error(exc) from exc
 
+    def delete_job(self, namespace: str, name: str) -> None:
+        try:
+            self.batch.delete_namespaced_job(
+                name, namespace, propagation_policy="Foreground"
+            )
+        except Exception as exc:
+            error = self._api_error(exc)
+            if isinstance(error, NotFoundError):
+                return
+            raise error from exc
+
+    def job_pods_gone(self, namespace: str, job_name: str) -> bool:
+        try:
+            pods = self.core.list_namespaced_pod(
+                namespace, label_selector=f"job-name={job_name}"
+            )
+            return not getattr(pods, "items", [])
+        except Exception as exc:
+            raise self._api_error(exc) from exc
+
+    def wait_job_pods_gone(self, namespace: str, job_name: str, timeout_seconds: int) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if self.job_pods_gone(namespace, job_name):
+                return True
+            time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+        return self.job_pods_gone(namespace, job_name)
+
+    def job_endpoint(self, namespace: str, job_name: str, port: int) -> str | None:
+        try:
+            pods = self.core.list_namespaced_pod(
+                namespace, label_selector=f"job-name={job_name}"
+            )
+            for pod in getattr(pods, "items", []):
+                pod_dict = self._serialize(pod)
+                if pod_dict.get("status", {}).get("phase") != "Running":
+                    continue
+                conditions = pod_dict.get("status", {}).get("conditions", [])
+                if not any(
+                    condition.get("type") == "Ready" and condition.get("status") == "True"
+                    for condition in conditions
+                ):
+                    continue
+                pod_ip = pod_dict.get("status", {}).get("podIP")
+                if pod_ip:
+                    return f"http://{pod_ip}:{port}"
+            return None
+        except Exception as exc:
+            raise self._api_error(exc) from exc
+
     def llm_scale(self, namespace: str, name: str, replicas: int) -> None:
         try:
             self.apps.patch_namespaced_deployment_scale(

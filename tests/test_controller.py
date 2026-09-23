@@ -1,6 +1,6 @@
 from image_gateway.config import Settings
 from image_gateway.controller import Controller
-from image_gateway.naming import diffuser_job_name, optimizer_job_name
+from image_gateway.naming import diffuser_job_name, optimizer_job_name, server_job_name
 
 from .conftest import FakeCluster, artifact_output, make_cr
 
@@ -125,3 +125,96 @@ def test_llm_scale_down_timeout_fails_request_and_restores_llm():
     assert result["status"]["phase"] == "Failed"
     assert result["status"]["failure"]["reason"] == "LlmScaleDownTimeout"
     assert cluster.scales[-1][2] == 1
+
+
+def test_openai_queue_reuses_the_ready_stable_diffusion_server_job():
+    cluster = FakeCluster()
+    first = make_cr("igr-openai-first")
+    first["metadata"]["uid"] = "12345678-1234-1234-1234-123456789abc"
+    first["metadata"]["creationTimestamp"] = "2026-01-01T00:00:00Z"
+    first["spec"].update({"operation": "openai", "optimizePrompt": False, "prompt": None})
+    second = make_cr("igr-openai-second")
+    second["metadata"]["uid"] = "87654321-4321-4321-4321-cba987654321"
+    second["metadata"]["creationTimestamp"] = "2026-01-01T00:01:00Z"
+    second["spec"].update({"operation": "openai", "optimizePrompt": False, "prompt": None})
+    cluster.requests[("images", first["metadata"]["name"])] = first
+    cluster.requests[("images", second["metadata"]["name"])] = second
+    server_name = server_job_name(first["metadata"]["uid"])
+    cluster.job_endpoints[("images", server_name)] = "http://10.1.2.3:8080"
+    controller = Controller(cluster, controller_settings())
+
+    assert controller.run_once()
+    assert cluster.get_request("images", first["metadata"]["name"])["status"]["phase"] == (
+        "Prepared"
+    )
+    assert controller.run_once()
+    assert cluster.get_request("images", second["metadata"]["name"])["status"]["phase"] == (
+        "Prepared"
+    )
+    assert controller.run_once()
+    assert controller.run_once()
+    first_status = cluster.get_request("images", first["metadata"]["name"])["status"]
+    assert first_status["phase"] == "Proxying"
+    assert first_status["serverJobName"] == server_name
+    assert first_status["serverUrl"] == "http://10.1.2.3:8080"
+
+    cluster.patch_request_status(
+        "images", first["metadata"]["name"], {"phase": "RestoringText"}
+    )
+    assert controller.run_once()
+    assert cluster.get_request("images", first["metadata"]["name"])["status"]["phase"] == (
+        "Succeeded"
+    )
+    second_status = cluster.get_request("images", second["metadata"]["name"])["status"]
+    assert second_status["phase"] == "Proxying"
+    assert second_status["serverJobName"] == server_name
+    assert second_status["serverUrl"] == "http://10.1.2.3:8080"
+    assert ("images", server_name) not in cluster.deleted_jobs
+
+    cluster.patch_request_status(
+        "images", second["metadata"]["name"], {"phase": "RestoringText"}
+    )
+    assert controller.run_once()
+    assert cluster.get_request("images", second["metadata"]["name"])["status"]["phase"] == (
+        "Succeeded"
+    )
+    assert ("images", server_name) in cluster.deleted_jobs
+    assert cluster.scales[-1][2] == 1
+
+
+def test_queued_generation_prompts_are_optimized_before_server_start():
+    cluster = FakeCluster()
+    first = make_cr("igr-openai-first")
+    first["metadata"]["uid"] = "12345678-1234-1234-1234-123456789abc"
+    first["metadata"]["creationTimestamp"] = "2026-01-01T00:00:00Z"
+    first["spec"].update({"operation": "openai", "optimizePrompt": False})
+    first["status"] = {"phase": "Prepared", "startedAt": "2026-01-01T00:00:00Z"}
+    second = make_cr("igr-openai-second")
+    second["metadata"]["uid"] = "87654321-4321-4321-4321-cba987654321"
+    second["metadata"]["creationTimestamp"] = "2026-01-01T00:01:00Z"
+    second["spec"].update({"operation": "openai", "optimizePrompt": True})
+    cluster.requests[("images", first["metadata"]["name"])] = first
+    cluster.requests[("images", second["metadata"]["name"])] = second
+    controller = Controller(cluster, controller_settings())
+
+    assert controller.run_once()
+    assert cluster.get_request("images", first["metadata"]["name"])["status"]["phase"] == (
+        "Prepared"
+    )
+    assert cluster.get_request("images", second["metadata"]["name"])["status"]["phase"] == (
+        "Optimizing"
+    )
+    optimizer = optimizer_job_name(second["metadata"]["uid"])
+    cluster.jobs[("images", optimizer)]["status"] = {"succeeded": 1}
+    cluster.outputs[("images", optimizer)] = (
+        '{"rewritten_prompt":"expanded second prompt","wh_ratio":"1:1"}'
+    )
+
+    assert controller.run_once()
+    assert cluster.get_request("images", second["metadata"]["name"])["status"]["phase"] == (
+        "Prepared"
+    )
+    assert controller.run_once()
+    assert cluster.get_request("images", first["metadata"]["name"])["status"]["phase"] == (
+        "StartingServer"
+    )

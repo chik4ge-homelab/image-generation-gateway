@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from string import Template
 
 import boto3
 
@@ -33,6 +34,38 @@ def _endpoint() -> str:
     return f"{endpoint}:{port}" if port else endpoint
 
 
+def _required_config(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise ValueError(f"missing required configuration: {name}")
+    return value
+
+
+def build_sd_cli_command(
+    request: dict, width: int, height: int, output_path: Path
+) -> list[str]:
+    try:
+        arguments = json.loads(_required_config("SD_CPP_ARGS"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("SD_CPP_ARGS must be a JSON array of argument templates") from exc
+    if not isinstance(arguments, list) or not all(isinstance(arg, str) for arg in arguments):
+        raise ValueError("SD_CPP_ARGS must be a JSON array of argument templates")
+
+    values = {
+        "PROMPT": request["prompt"],
+        "STEPS": str(request.get("steps", 40)),
+        "SEED": str(request.get("seed", 42)),
+        "WIDTH": str(width),
+        "HEIGHT": str(height),
+        "OUTPUT": str(output_path),
+    }
+    try:
+        expanded = [Template(arg).substitute(values) for arg in arguments]
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"invalid placeholder in SD_CPP_ARGS: {exc}") from exc
+    return ["/sd.cpp/bin/sd-cli", *expanded]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -41,44 +74,10 @@ def main() -> None:
 
     request = json.loads(Path(args.input).read_text())
     width, height = SIZES[request["wh_ratio"]]
-    model_dir = Path(os.environ["MODEL_PATH"])
     with tempfile.TemporaryDirectory() as output_dir:
         image_path = Path(output_dir) / "image.png"
-        subprocess.run(
-            [
-                "/sd.cpp/bin/sd-cli",
-                "--diffusion-model",
-                str(model_dir / "qwen_image_2.1-Q4_K.gguf"),
-                "--vae",
-                str(model_dir / "vae/qwen_image_2.1_vae_bf16.safetensors"),
-                "--llm",
-                str(model_dir / "Qwen3VL-8B-Instruct-Q4_K_M.gguf"),
-                "-p",
-                request["prompt"],
-                "--cfg-scale",
-                "6",
-                "--sampling-method",
-                "euler",
-                "--steps",
-                str(request.get("steps", 40)),
-                "--seed",
-                str(request.get("seed", 42)),
-                "--backend",
-                "diffusion=cuda0,te=cpu,vae=cuda0",
-                "--params-backend",
-                "diffusion=disk,te=cpu,vae=cuda0",
-                "--max-vram",
-                "cuda0=6",
-                "--diffusion-fa",
-                "-W",
-                str(width),
-                "-H",
-                str(height),
-                "-o",
-                str(image_path),
-            ],
-            check=True,
-        )
+        command = build_sd_cli_command(request, width, height, image_path)
+        subprocess.run(command, check=True)
         payload = image_path.read_bytes()
         digest = hashlib.sha256(payload).hexdigest()
         client = boto3.client(
