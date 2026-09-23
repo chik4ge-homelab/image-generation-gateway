@@ -9,6 +9,24 @@ from image_gateway.naming import request_name
 from .conftest import FakeCluster
 
 
+class SucceededCluster(FakeCluster):
+    def create_request(self, namespace, body):
+        result = super().create_request(namespace, body)
+        result["status"] = {
+            "phase": "Succeeded",
+            "optimizer": {"rewrittenPrompt": "a carefully composed fox", "whRatio": "16:9"},
+            "artifact": {
+                "key": "image-generation/generated.png",
+                "sha256": "0" * 64,
+                "contentType": "image/png",
+                "width": 1344,
+                "height": 768,
+            },
+        }
+        self.requests[(namespace, body["metadata"]["name"])] = result
+        return result
+
+
 def routes(app):
     return {route.path: route.endpoint for route in app.routes if hasattr(route, "path")}
 
@@ -112,3 +130,97 @@ def test_artifact_endpoint_returns_download_url():
     assert response.json()["url"] == (
         "http://objects/image-generation/igr-artifact.png"
     )
+
+
+def test_openai_images_generations_uses_authenticated_standard_contract():
+    cluster = SucceededCluster()
+    client = TestClient(
+        create_app(
+            cluster=cluster,
+            settings=Settings(
+                namespace="images",
+                argocd_application_name="llm-gateway",
+                artifact_endpoint="https://objects.example",
+                llm_gateway_api_key="secret",
+            ),
+        )
+    )
+
+    response = client.post(
+        "/v1/images/generations",
+        headers={"Authorization": "Bearer secret"},
+        json={
+            "model": "dall-e-3",
+            "prompt": "a fox in a forest",
+            "size": "1792x1024",
+            "response_format": "url",
+            "n": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert isinstance(body["created"], int)
+    assert body["data"] == [
+        {
+            "url": "https://objects.example/image-generation/generated.png",
+            "revised_prompt": "a carefully composed fox",
+        }
+    ]
+    generated = next(iter(cluster.requests.values()))
+    assert generated["spec"]["aspectRatio"] == "16:9"
+    assert generated["spec"]["suspend"] is False
+
+
+def test_openai_images_generations_supports_base64_response(monkeypatch):
+    cluster = SucceededCluster()
+    client = TestClient(
+        create_app(
+            cluster=cluster,
+            settings=Settings(
+                namespace="images", llm_gateway_api_key="secret", artifact_endpoint="https://objects"
+            ),
+        )
+    )
+    monkeypatch.setattr("image_gateway.api._download_image", lambda url: b"png-bytes")
+
+    response = client.post(
+        "/v1/images/generations",
+        headers={"Authorization": "Bearer secret"},
+        json={"prompt": "a cat", "response_format": "b64_json"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"][0]["b64_json"] == "cG5nLWJ5dGVz"
+
+
+@pytest.mark.parametrize(
+    ("headers", "payload", "status", "code"),
+    [
+        ({}, {"prompt": "a cat"}, 401, "invalid_api_key"),
+        (
+            {"Authorization": "Bearer secret"},
+            {"prompt": "a cat", "size": "auto"},
+            400,
+            "invalid_request",
+        ),
+        (
+            {"Authorization": "Bearer secret"},
+            {"prompt": "a cat", "n": 2},
+            400,
+            "invalid_request",
+        ),
+    ],
+)
+def test_openai_images_generations_uses_openai_error_shape(headers, payload, status, code):
+    client = TestClient(
+        create_app(
+            cluster=SucceededCluster(),
+            settings=Settings(namespace="images", llm_gateway_api_key="secret"),
+        )
+    )
+
+    response = client.post("/v1/images/generations", headers=headers, json=payload)
+
+    assert response.status_code == status
+    assert response.json()["error"]["code"] == code

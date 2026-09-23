@@ -16,6 +16,9 @@ class Settings:
     llm_stop_timeout_seconds: int = 300
     llm_restore_timeout_seconds: int = 60
     poll_interval_seconds: float = 2.0
+    api_poll_interval_seconds: float = 2.0
+    image_generation_timeout_seconds: int = 3600
+    llm_gateway_api_key: str = ""
     port: int = 8080
 
     @classmethod
@@ -39,6 +42,15 @@ class Settings:
             poll_interval_seconds=float(
                 os.getenv("CONTROLLER_POLL_INTERVAL_SECONDS", str(cls.poll_interval_seconds))
             ),
+            api_poll_interval_seconds=float(
+                os.getenv("API_POLL_INTERVAL_SECONDS", str(cls.api_poll_interval_seconds))
+            ),
+            image_generation_timeout_seconds=int(
+                os.getenv(
+                    "IMAGE_GENERATION_TIMEOUT_SECONDS", str(cls.image_generation_timeout_seconds)
+                )
+            ),
+            llm_gateway_api_key=os.getenv("LLM_GATEWAY_API_KEY", ""),
             port=int(os.getenv("IMAGE_GATEWAY_PORT", str(cls.port))),
         )
 

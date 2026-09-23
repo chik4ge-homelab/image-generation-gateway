@@ -20,6 +20,7 @@ The API listens on port `IMAGE_GATEWAY_PORT` (default `8080`). The controller po
 - `GET /v1/images/jobs/{job_id}` returns the CR state.
 - `POST /v1/images/jobs/{job_id}/start` changes `spec.suspend` to `false`.
 - `GET /v1/images/jobs/{job_id}/artifact` returns artifact metadata and its object endpoint URL after success.
+- `POST /v1/images/generations` accepts the OpenAI Images API request shape and returns its `created`/`data` response. It supports one image per request, `url` or `b64_json`, and maps standard landscape/portrait sizes to the gateway's supported aspect ratios. The route requires `Authorization: Bearer <LLM_GATEWAY_API_KEY>` and waits synchronously for the generated artifact.
 - `/healthz` and `/readyz` are available for probes.
 
 `job_id` and the CR name are deterministic from the idempotency key. A retry after a create conflict reads the same CR and returns it.

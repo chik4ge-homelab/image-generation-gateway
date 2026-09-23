@@ -36,6 +36,46 @@ class ImageJobCreate(BaseModel):
         return validate_ratio(value)
 
 
+class OpenAIImageGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(min_length=1, max_length=8192)
+    model: str | None = None
+    n: int = Field(default=1, ge=1, le=1)
+    size: str = "1024x1024"
+    response_format: Literal["url", "b64_json"] = "url"
+    quality: Literal["standard", "hd"] | None = None
+    style: Literal["vivid", "natural"] | None = None
+    user: str | None = None
+
+    @field_validator("prompt")
+    @classmethod
+    def reject_blank_prompt(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("size")
+    @classmethod
+    def check_size(cls, value: str) -> str:
+        if value not in OPENAI_SIZE_RATIOS:
+            raise ValueError("size is not supported by this image-generation endpoint")
+        return value
+
+
+OPENAI_SIZE_RATIOS = {
+    "1024x1024": "1:1",
+    "1536x1024": "3:2",
+    "1024x1536": "2:3",
+    "1792x1024": "16:9",
+    "1024x1792": "9:16",
+    "1216x832": "3:2",
+    "832x1216": "2:3",
+    "1344x768": "16:9",
+    "768x1344": "9:16",
+}
+
+
 class ImageJobSpec(ImageJobCreate):
     suspend: bool = True
 
