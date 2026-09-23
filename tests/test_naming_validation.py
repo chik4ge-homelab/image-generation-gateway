@@ -31,6 +31,10 @@ def test_optimizer_output_is_strict_and_limited():
     result = parse_optimizer_output('{"rewritten_prompt":"cat","wh_ratio":"16:9"}')
     assert result.rewritten_prompt == "cat"
     assert result.wh_ratio == "16:9"
+    result = parse_optimizer_output(
+        'thinking...\n{"rewritten_prompt":"cat","wh_ratio":"16:9"}\n'
+    )
+    assert result.rewritten_prompt == "cat"
 
     with pytest.raises(StrictJSONError):
         parse_optimizer_output('{"rewritten_prompt":"cat","wh_ratio":"16:9","extra":1}')
@@ -38,3 +42,5 @@ def test_optimizer_output_is_strict_and_limited():
         parse_optimizer_output('{"rewritten_prompt":"cat","wh_ratio":"16:9","wh_ratio":"1:1"}')
     with pytest.raises(StrictJSONError):
         parse_optimizer_output("x" * 4097)
+    with pytest.raises(StrictJSONError):
+        parse_optimizer_output("completion without json")

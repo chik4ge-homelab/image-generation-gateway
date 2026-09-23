@@ -28,7 +28,6 @@ jobs:
       matrix:
         target:
           - gateway
-          - optimizer
           - diffuser
     steps:
       - uses: actions/checkout@v4

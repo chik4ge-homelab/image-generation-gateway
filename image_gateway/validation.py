@@ -41,7 +41,20 @@ def parse_limited_json(
 
 
 def parse_optimizer_output(raw: str | bytes) -> OptimizerResult:
-    value = parse_limited_json(raw, validator=OptimizerResult.model_validate)
+    encoded = raw.encode("utf-8") if isinstance(raw, str) else raw
+    if len(encoded) > 4096:
+        raise StrictJSONError("optimizer output exceeds 4096 bytes")
+    try:
+        text = encoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise StrictJSONError(f"invalid optimizer output encoding: {exc}") from exc
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        raise StrictJSONError("optimizer output did not contain a JSON object")
+    value = parse_limited_json(
+        text[start : end + 1], validator=OptimizerResult.model_validate
+    )
     if set(value.model_dump()) != {"rewritten_prompt", "wh_ratio"}:
         raise StrictJSONError("optimizer output must contain only rewritten_prompt and wh_ratio")
     return value
