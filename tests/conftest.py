@@ -12,6 +12,10 @@ class FakeCluster:
         self.requests = {}
         self.configmaps = {}
         self.jobs = {}
+        self.cronjobs = {
+            ("images", "image-generation-optimizer"): make_cronjob_template("optimizer"),
+            ("images", "image-generation-diffuser"): make_cronjob_template("diffuser"),
+        }
         self.outputs = {}
         self.scales = []
         self.pods_gone = True
@@ -99,6 +103,12 @@ class FakeCluster:
         self.jobs[key] = result
         return copy.deepcopy(result)
 
+    def get_cronjob(self, namespace, name):
+        try:
+            return copy.deepcopy(self.cronjobs[(namespace, name)])
+        except KeyError as exc:
+            raise NotFoundError(name) from exc
+
     def llm_scale(self, namespace, name, replicas):
         self.scales.append((namespace, name, replicas))
 
@@ -136,6 +146,80 @@ def make_cr(name="igr-test"):
             "steps": 40,
             "seed": 42,
             "suspend": False,
+        },
+    }
+
+
+def make_cronjob_template(worker):
+    is_optimizer = worker == "optimizer"
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "CronJob",
+        "metadata": {"name": f"image-generation-{worker}"},
+        "spec": {
+            "suspend": True,
+            "jobTemplate": {
+                "metadata": {"labels": {"app.kubernetes.io/part-of": "image-generation"}},
+                "spec": {
+                    "backoffLimit": 0,
+                    "activeDeadlineSeconds": 3600,
+                    "ttlSecondsAfterFinished": 3600,
+                    "template": {
+                        "metadata": {"labels": {"app.kubernetes.io/part-of": "image-generation"}},
+                        "spec": {
+                            "restartPolicy": "Never",
+                            "serviceAccountName": "image-generation-job",
+                            "runtimeClassName": "nvidia",
+                            "containers": [
+                                {
+                                    "name": worker,
+                                    "image": f"{worker}:test",
+                                    "args": ["--input", "/inputs/input.json"],
+                                    "env": [{"name": "MODEL_PATH", "value": "/models/model.gguf"}],
+                                    "resources": {
+                                        "requests": {
+                                            "memory": "4Gi" if is_optimizer else "6Gi",
+                                            "nvidia.com/gpu": "1",
+                                        },
+                                        "limits": {
+                                            "memory": "4Gi" if is_optimizer else "12Gi",
+                                            "nvidia.com/gpu": "1",
+                                        },
+                                    },
+                                    "volumeMounts": [
+                                        {"name": "input", "mountPath": "/inputs", "readOnly": True},
+                                        {
+                                            "name": "models",
+                                            "mountPath": "/models",
+                                            "readOnly": True,
+                                        },
+                                    ],
+                                    **(
+                                        {"envFrom": [{"secretRef": {"name": "artifacts"}}]}
+                                        if not is_optimizer
+                                        else {}
+                                    ),
+                                }
+                            ],
+                            "volumes": [
+                                {
+                                    "name": "input",
+                                    "configMap": {
+                                        "name": f"image-generation-{worker}-input-template",
+                                        "items": [{"key": "input.json", "path": "input.json"}],
+                                    },
+                                },
+                                {
+                                    "name": "models",
+                                    "persistentVolumeClaim": {
+                                        "claimName": "image-generation-models"
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                },
+            },
         },
     }
 

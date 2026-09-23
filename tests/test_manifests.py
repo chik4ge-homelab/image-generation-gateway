@@ -1,23 +1,32 @@
 from image_gateway.config import Settings
-from image_gateway.manifests import diffuser_job, optimizer_configmap, optimizer_job
+from image_gateway.manifests import job_from_cronjob, optimizer_configmap
 from image_gateway.naming import diffuser_job_name, optimizer_job_name
 
-from .conftest import make_cr
+from .conftest import make_cr, make_cronjob_template
 
 
-def test_job_manifests_are_deterministic_and_have_safety_limits():
+def test_jobs_clone_argocd_managed_suspended_cronjob_templates():
     settings = Settings(
-        optimizer_image="optimizer:test",
-        diffuser_image="diffuser:test",
-        optimizer_model_path="/models/optimizer.gguf",
-        diffuser_model_path="/models/diffuser.safetensors",
-        object_bucket_secret_name="object-bucket",
         artifact_endpoint="https://objects.example.test",
         argocd_application_name="llm-gateway",
     )
     cr = make_cr()
-    optimizer = optimizer_job(cr, settings)
-    diffuser = diffuser_job(cr, settings)
+    optimizer_template = make_cronjob_template("optimizer")
+    diffuser_template = make_cronjob_template("diffuser")
+    optimizer = job_from_cronjob(
+        cr,
+        settings,
+        optimizer_template,
+        name=optimizer_job_name(cr["metadata"]["uid"]),
+        configmap_name="optimizer-input",
+    )
+    diffuser = job_from_cronjob(
+        cr,
+        settings,
+        diffuser_template,
+        name=diffuser_job_name(cr["metadata"]["uid"]),
+        configmap_name="diffuser-input",
+    )
 
     assert optimizer["metadata"]["name"] == optimizer_job_name(cr["metadata"]["uid"])
     assert diffuser["metadata"]["name"] == diffuser_job_name(cr["metadata"]["uid"])
@@ -39,6 +48,10 @@ def test_job_manifests_are_deterministic_and_have_safety_limits():
         assert spec["ttlSecondsAfterFinished"] > 0
         assert spec["template"]["spec"]["restartPolicy"] == "Never"
         assert "command" not in spec["template"]["spec"]["containers"][0]
+        assert job["metadata"]["ownerReferences"][0]["name"] == cr["metadata"]["name"]
+        assert job["metadata"]["labels"]["image-job"] == job["metadata"]["name"]
+        input_volume = next(v for v in spec["template"]["spec"]["volumes"] if v["name"] == "input")
+        assert input_volume["configMap"]["name"] in {"optimizer-input", "diffuser-input"}
     for job in (optimizer, diffuser):
         assert job["spec"]["template"]["spec"]["runtimeClassName"] == "nvidia"
         container = job["spec"]["template"]["spec"]["containers"][0]
@@ -52,14 +65,26 @@ def test_job_manifests_are_deterministic_and_have_safety_limits():
     optimizer_resources = optimizer["spec"]["template"]["spec"]["containers"][0]["resources"]
     diffuser_resources = diffuser["spec"]["template"]["spec"]["containers"][0]["resources"]
     assert optimizer_resources["requests"]["memory"] == "4Gi"
-    assert optimizer_resources["limits"]["memory"] == "12Gi"
+    assert optimizer_resources["limits"]["memory"] == "4Gi"
     assert diffuser_resources["requests"]["memory"] == "6Gi"
     assert diffuser_resources["limits"]["memory"] == "12Gi"
-    optimizer_env = optimizer["spec"]["template"]["spec"]["containers"][0]["env"]
-    diffuser_env = diffuser["spec"]["template"]["spec"]["containers"][0]["env"]
-    assert {item["name"]: item["value"] for item in optimizer_env}["MODEL_PATH"] == (
-        "/models/optimizer.gguf"
-    )
-    assert {item["name"]: item["value"] for item in diffuser_env}["MODEL_PATH"] == (
-        "/models/diffuser.safetensors"
-    )
+    assert optimizer_template["spec"]["suspend"] is True
+    optimizer_input = optimizer_template["spec"]["jobTemplate"]["spec"]["template"]["spec"][
+        "volumes"
+    ][0]["configMap"]["name"]
+    assert optimizer_input == "image-generation-optimizer-input-template"
+
+
+def test_running_cronjob_cannot_be_used_as_a_template():
+    settings = Settings(artifact_endpoint="https://objects.example.test")
+    cronjob = make_cronjob_template("optimizer")
+    cronjob["spec"]["suspend"] = False
+
+    try:
+        job_from_cronjob(
+            make_cr(), settings, cronjob, name="igr-opt-test", configmap_name="optimizer-input"
+        )
+    except ValueError as exc:
+        assert "not suspended" in str(exc)
+    else:
+        raise AssertionError("an active CronJob must not be used as a template")

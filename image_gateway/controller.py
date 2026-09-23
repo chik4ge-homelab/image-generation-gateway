@@ -7,7 +7,13 @@ from typing import Any
 
 from .cluster import ConflictError, NotFoundError
 from .config import Settings
-from .manifests import diffuser_configmap, diffuser_job, optimizer_configmap, optimizer_job
+from .manifests import (
+    DIFFUSER_CRONJOB_NAME,
+    OPTIMIZER_CRONJOB_NAME,
+    diffuser_configmap,
+    job_from_cronjob,
+    optimizer_configmap,
+)
 from .models import TERMINAL_PHASES
 from .naming import (
     diffuser_configmap_name,
@@ -120,7 +126,9 @@ class Controller:
             config_name = optimizer_configmap_name(uid)
             self._ensure_configmap(optimizer_configmap(cr, self.settings), config_name)
             job_name = optimizer_job_name(uid)
-            job = self._ensure_job(optimizer_job(cr, self.settings), job_name)
+            job = self._ensure_template_job(
+                cr, OPTIMIZER_CRONJOB_NAME, job_name, config_name
+            )
             outcome = self._job_outcome(job)
             if outcome == "running":
                 return
@@ -165,7 +173,9 @@ class Controller:
                 diffuser_configmap(cr, self.settings, rewritten_prompt, wh_ratio), config_name
             )
             job_name = diffuser_job_name(uid)
-            job = self._ensure_job(diffuser_job(cr, self.settings), job_name)
+            job = self._ensure_template_job(
+                cr, DIFFUSER_CRONJOB_NAME, job_name, config_name
+            )
             outcome = self._job_outcome(job)
             if outcome == "running":
                 return
@@ -229,11 +239,21 @@ class Controller:
             except ConflictError:
                 pass
 
-    def _ensure_job(self, manifest: dict[str, Any], name: str) -> dict[str, Any]:
+    def _ensure_template_job(
+        self, cr: dict[str, Any], cronjob_name: str, name: str, configmap_name: str
+    ) -> dict[str, Any]:
         try:
             return self.cluster.get_job(self.settings.namespace, name)
         except NotFoundError:
             try:
+                cronjob = self.cluster.get_cronjob(self.settings.namespace, cronjob_name)
+                manifest = job_from_cronjob(
+                    cr,
+                    self.settings,
+                    cronjob,
+                    name=name,
+                    configmap_name=configmap_name,
+                )
                 return self.cluster.create_job(self.settings.namespace, manifest)
             except ConflictError:
                 return self.cluster.get_job(self.settings.namespace, name)

@@ -1,5 +1,6 @@
 import importlib.util
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -29,7 +30,7 @@ def test_optimizer_has_bounded_gpu_inference():
     assert optimizer.MAX_TOKENS == "1024"
     assert optimizer.CONTEXT_SIZE == "2048"
     assert optimizer.GPU_LAYERS == "99"
-    assert optimizer.THREADS == "4"
+    assert optimizer.THREADS == "2"
     assert optimizer.TIMEOUT_SECONDS == 300
 
 
@@ -51,3 +52,36 @@ def test_optimizer_does_not_buffer_llama_stderr(monkeypatch):
     assert captured["stdout"] is subprocess.PIPE
     assert "stderr" not in captured
     assert "capture_output" not in captured
+
+
+def test_optimizer_uses_llm_gateway_memory_tuning(monkeypatch):
+    optimizer = _load("optimizer")
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return subprocess.CompletedProcess(
+            command, 0, stdout='{"rewritten_prompt":"x","wh_ratio":"1:1"}'
+        )
+
+    monkeypatch.setattr(optimizer.subprocess, "run", fake_run)
+    monkeypatch.setenv("MODEL_PATH", "/models/model.gguf")
+    with tempfile.TemporaryDirectory() as directory:
+        input_path = Path(directory) / "input.json"
+        output_path = Path(directory) / "output.json"
+        input_path.write_text('{"prompt":"cat"}')
+        monkeypatch.setattr(
+            "sys.argv",
+            ["optimizer", "--input", str(input_path), "--output", str(output_path)],
+        )
+        optimizer.main()
+
+    command = captured["command"]
+    for pair in (
+        ("--flash-attn", "on"),
+        ("-ctk", "q8_0"),
+        ("-ctv", "q8_0"),
+        ("-b", "512"),
+        ("-ub", "512"),
+    ):
+        assert list(pair) == command[command.index(pair[0]) : command.index(pair[0]) + 2]

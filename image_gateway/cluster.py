@@ -133,6 +133,13 @@ class KubernetesCluster:
         except Exception as exc:
             raise self._api_error(exc) from exc
 
+    def get_cronjob(self, namespace: str, name: str) -> dict[str, Any]:
+        try:
+            obj = self.batch.read_namespaced_cron_job(name, namespace)
+            return self._serialize(obj)
+        except Exception as exc:
+            raise self._api_error(exc) from exc
+
     def create_job(self, namespace: str, body: dict[str, Any]) -> dict[str, Any]:
         try:
             obj = self.batch.create_namespaced_job(namespace, body)

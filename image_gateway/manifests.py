@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any
 
 from .argocd import tracking_annotations
 from .config import Settings
 from .naming import (
     diffuser_configmap_name,
-    diffuser_job_name,
     optimizer_configmap_name,
-    optimizer_job_name,
 )
 
 GROUP = "homelab.chik4ge.me"
 VERSION = "v1alpha1"
 KIND = "ImageGenerationRequest"
+OPTIMIZER_CRONJOB_NAME = "image-generation-optimizer"
+DIFFUSER_CRONJOB_NAME = "image-generation-diffuser"
 
 
 def owner_reference(cr: dict[str, Any]) -> dict[str, Any]:
@@ -92,51 +93,54 @@ def diffuser_configmap(
     )
 
 
-def _common_job(
-    *,
+def job_from_cronjob(
     cr: dict[str, Any],
     settings: Settings,
+    cronjob: dict[str, Any],
+    *,
     name: str,
     configmap_name: str,
-    container_name: str,
-    image: str,
-    model_path: str,
-    args: list[str],
-    gpu: bool,
-    artifact_credentials: bool,
 ) -> dict[str, Any]:
+    cronjob_spec = cronjob.get("spec", {})
+    if cronjob_spec.get("suspend") is not True:
+        template_name = cronjob.get("metadata", {}).get("name")
+        raise ValueError(f"CronJob template {template_name} is not suspended")
+
     namespace = cr["metadata"]["namespace"]
-    env = [
-        {"name": "INPUT_PATH", "value": "/inputs/input.json"},
-        {"name": "OUTPUT_PATH", "value": "/dev/termination-log"},
-        {"name": "MODEL_PATH", "value": model_path},
-        {"name": "ARTIFACT_ENDPOINT", "value": settings.artifact_endpoint},
-    ]
-    container: dict[str, Any] = {
-        "name": container_name,
-        "image": image,
-        "imagePullPolicy": "IfNotPresent",
-        "args": args,
-        "env": env,
-        "volumeMounts": [
-            {"name": "input", "mountPath": "/inputs", "readOnly": True},
-            {"name": "models", "mountPath": "/models", "readOnly": True},
-        ],
-    }
-    if artifact_credentials:
-        container["envFrom"] = [{"secretRef": {"name": settings.object_bucket_secret_name}}]
-    if gpu:
-        gpu_resources = {settings.gpu_resource_name: str(settings.gpu_count)}
-        if container_name == "diffuser":
-            container["resources"] = {
-                "requests": {"cpu": "2", "memory": "6Gi", **gpu_resources},
-                "limits": {"memory": "12Gi", **gpu_resources},
-            }
-        else:
-            container["resources"] = {
-                "requests": {"cpu": "2", "memory": "4Gi", **gpu_resources},
-                "limits": {"memory": "12Gi", **gpu_resources},
-            }
+    job_template = cronjob_spec.get("jobTemplate", {})
+    job_spec = deepcopy(job_template.get("spec", {}))
+    pod_spec = job_spec.get("template", {}).get("spec", {})
+    input_volume = next(
+        (
+            volume
+            for volume in pod_spec.get("volumes", [])
+            if volume.get("name") == "input" and "configMap" in volume
+        ),
+        None,
+    )
+    if input_volume is None:
+        template_name = cronjob.get("metadata", {}).get("name")
+        raise ValueError(f"CronJob template {template_name} has no input volume")
+    input_volume["configMap"]["name"] = configmap_name
+
+    labels = deepcopy(job_template.get("metadata", {}).get("labels", {}))
+    labels.update({"app.kubernetes.io/part-of": "image-generation", "image-job": name})
+    template = job_spec.get("template", {})
+    pod_metadata = template.setdefault("metadata", {})
+    pod_labels = deepcopy(pod_metadata.get("labels", {}))
+    pod_labels.update({"job-name": name, "image-job": name})
+    pod_metadata["labels"] = pod_labels
+    annotations = deepcopy(job_template.get("metadata", {}).get("annotations", {}))
+    annotations.update(
+        tracking_annotations(
+            settings.argocd_application_name,
+            group="batch",
+            kind="Job",
+            namespace=namespace,
+            name=name,
+        )
+    )
+
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -144,72 +148,8 @@ def _common_job(
             "name": name,
             "namespace": namespace,
             "ownerReferences": [owner_reference(cr)],
-            "labels": {"app.kubernetes.io/part-of": "image-generation", "image-job": name},
-            "annotations": tracking_annotations(
-                settings.argocd_application_name,
-                group="batch",
-                kind="Job",
-                namespace=namespace,
-                name=name,
-            ),
+            "labels": labels,
+            "annotations": annotations,
         },
-        "spec": {
-            "backoffLimit": 0,
-            "activeDeadlineSeconds": settings.job_active_deadline_seconds,
-            "ttlSecondsAfterFinished": settings.job_ttl_seconds,
-            "template": {
-                "metadata": {"labels": {"job-name": name, "image-job": name}},
-                "spec": {
-                    "restartPolicy": "Never",
-                    "serviceAccountName": settings.job_service_account_name,
-                    "runtimeClassName": settings.gpu_runtime_class_name,
-                    "containers": [container],
-                    "volumes": [
-                        {
-                            "name": "input",
-                            "configMap": {
-                                "name": configmap_name,
-                                "items": [{"key": "input.json", "path": "input.json"}],
-                            },
-                        },
-                        {
-                            "name": "models",
-                            "persistentVolumeClaim": {"claimName": settings.model_pvc_name},
-                        },
-                    ],
-                },
-            },
-        },
+        "spec": job_spec,
     }
-
-
-def optimizer_job(cr: dict[str, Any], settings: Settings) -> dict[str, Any]:
-    uid = cr["metadata"]["uid"]
-    return _common_job(
-        cr=cr,
-        settings=settings,
-        name=optimizer_job_name(uid),
-        configmap_name=optimizer_configmap_name(uid),
-        container_name="optimizer",
-        image=settings.optimizer_image,
-        model_path=settings.optimizer_model_path,
-        args=["--input", "/inputs/input.json", "--output", "/dev/termination-log"],
-        gpu=True,
-        artifact_credentials=False,
-    )
-
-
-def diffuser_job(cr: dict[str, Any], settings: Settings) -> dict[str, Any]:
-    uid = cr["metadata"]["uid"]
-    return _common_job(
-        cr=cr,
-        settings=settings,
-        name=diffuser_job_name(uid),
-        configmap_name=diffuser_configmap_name(uid),
-        container_name="diffuser",
-        image=settings.diffuser_image,
-        model_path=settings.diffuser_model_path,
-        args=["--input", "/inputs/input.json", "--output", "/dev/termination-log"],
-        gpu=True,
-        artifact_credentials=True,
-    )

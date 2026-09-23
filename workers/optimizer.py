@@ -11,7 +11,7 @@ RATIOS = ("1:1", "3:2", "2:3", "16:9", "9:16")
 MAX_TOKENS = "1024"
 CONTEXT_SIZE = "2048"
 GPU_LAYERS = "99"
-THREADS = "4"
+THREADS = "2"
 TIMEOUT_SECONDS = 300
 
 
@@ -67,6 +67,16 @@ def main() -> None:
             GPU_LAYERS,
             "-t",
             THREADS,
+            "--flash-attn",
+            "on",
+            "-ctk",
+            "q8_0",
+            "-ctv",
+            "q8_0",
+            "-b",
+            "512",
+            "-ub",
+            "512",
             "--temp",
             "0",
             "--seed",

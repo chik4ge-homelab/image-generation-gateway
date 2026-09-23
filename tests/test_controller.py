@@ -8,12 +8,8 @@ from .conftest import FakeCluster, artifact_output, make_cr
 def controller_settings():
     return Settings(
         namespace="images",
-        optimizer_image="optimizer:test",
-        diffuser_image="diffuser:test",
-        optimizer_model_path="/models/optimizer.gguf",
-        diffuser_model_path="/models/diffuser.safetensors",
-        object_bucket_secret_name="object-bucket",
         artifact_endpoint="https://objects.example.test",
+        argocd_application_name="llm-gateway",
     )
 
 
