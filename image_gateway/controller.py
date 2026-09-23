@@ -96,7 +96,10 @@ class Controller:
         if phase == "StoppingText":
             self._stopping_text(cr)
         elif phase == "Optimizing":
-            self._optimizing(cr)
+            if cr.get("spec", {}).get("operation") == "openai":
+                self._patch_phase(cr, "Prepared")
+            else:
+                self._optimizing(cr)
         elif phase == "Generating":
             self._generating(cr)
         elif phase == "Prepared":
@@ -119,7 +122,6 @@ class Controller:
                 next_phase = (
                     "Prepared"
                     if cr.get("spec", {}).get("operation") == "openai"
-                    and not cr.get("spec", {}).get("optimizePrompt", False)
                     else "Optimizing"
                 )
                 self._patch_phase(cr, next_phase)
@@ -181,18 +183,6 @@ class Controller:
                 item["metadata"]["name"],
             ),
         )
-        optimizing = next(
-            (
-                item
-                for item in requests
-                if item.get("spec", {}).get("operation") == "openai"
-                and item.get("status", {}).get("phase") == "Optimizing"
-            ),
-            None,
-        )
-        if optimizing:
-            self._optimizing(optimizing)
-            return
         queued = next(
             (
                 item
@@ -203,31 +193,15 @@ class Controller:
             None,
         )
         if queued and queued.get("spec", {}).get("operation") == "openai":
-            if queued.get("spec", {}).get("optimizePrompt", False):
-                try:
-                    self.cluster.patch_request_status(
-                        self.settings.namespace,
-                        queued["metadata"]["name"],
-                        {"phase": "Optimizing", "startedAt": self._now()},
-                        resource_version=queued.get("metadata", {}).get("resourceVersion"),
-                    )
-                except ConflictError:
-                    return
-                self._optimizing(
-                    self.cluster.get_request(
-                        self.settings.namespace, queued["metadata"]["name"]
-                    )
+            try:
+                self.cluster.patch_request_status(
+                    self.settings.namespace,
+                    queued["metadata"]["name"],
+                    {"phase": "Prepared", "startedAt": self._now()},
+                    resource_version=queued.get("metadata", {}).get("resourceVersion"),
                 )
-            else:
-                try:
-                    self.cluster.patch_request_status(
-                        self.settings.namespace,
-                        queued["metadata"]["name"],
-                        {"phase": "Prepared", "startedAt": self._now()},
-                        resource_version=queued.get("metadata", {}).get("resourceVersion"),
-                    )
-                except ConflictError:
-                    return
+            except ConflictError:
+                return
             return
         self._patch_phase(cr, "StartingServer")
 
@@ -403,9 +377,6 @@ class Controller:
             None,
         )
         if not queued or queued.get("spec", {}).get("operation") != "openai":
-            return False
-        queued_phase = queued.get("status", {}).get("phase", "Pending")
-        if queued_phase == "Pending" and queued.get("spec", {}).get("optimizePrompt", False):
             return False
         next_status: dict[str, Any] = {
             "phase": "Proxying",

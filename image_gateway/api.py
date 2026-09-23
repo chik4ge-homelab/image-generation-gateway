@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import json
-import math
 import time
 from typing import Any
 from uuid import uuid4
@@ -40,43 +38,6 @@ def _openai_error(
             }
         },
     )
-
-
-def _request_prompt(raw_body: bytes) -> tuple[str | None, str]:
-    try:
-        payload = json.loads(raw_body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None, "1:1"
-    if not isinstance(payload, dict):
-        return None, "1:1"
-    prompt = payload.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8192:
-        return None, "1:1"
-    ratio = "1:1"
-    size = payload.get("size")
-    if isinstance(size, str) and "x" in size:
-        try:
-            width, height = (int(part) for part in size.lower().split("x", 1))
-            if width > 0 and height > 0:
-                divisor = math.gcd(width, height)
-                ratio = f"{width // divisor}:{height // divisor}"
-        except ValueError:
-            pass
-    return prompt, ratio if len(ratio) <= 16 else "1:1"
-
-
-def _optimized_body(raw_body: bytes, status: dict[str, Any]) -> bytes:
-    rewritten_prompt = status.get("optimizer", {}).get("rewrittenPrompt")
-    if not rewritten_prompt:
-        return raw_body
-    try:
-        payload = json.loads(raw_body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return raw_body
-    if not isinstance(payload, dict) or not isinstance(payload.get("prompt"), str):
-        return raw_body
-    payload["prompt"] = rewritten_prompt
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def _forward_request_headers(request: FastAPIRequest) -> dict[str, str]:
@@ -165,17 +126,13 @@ def create_app(*, cluster: Any | None = None, settings: Settings | None = None) 
 
         is_generation = http_request.url.path.endswith("/generations")
         raw_body = await http_request.body() if is_generation else None
-        prompt, aspect_ratio = _request_prompt(raw_body) if raw_body is not None else (None, "1:1")
         request_id = f"openai-{uuid4()}"
         name = request_name(request_id)
         spec: dict[str, Any] = {
             "idempotencyKey": request_id,
             "operation": "openai",
-            "optimizePrompt": prompt is not None,
             "suspend": False,
         }
-        if prompt is not None:
-            spec.update({"prompt": prompt, "aspectRatio": aspect_ratio})
         body = {
             "apiVersion": "homelab.chik4ge.me/v1alpha1",
             "kind": "ImageGenerationRequest",
@@ -242,9 +199,7 @@ def create_app(*, cluster: Any | None = None, settings: Settings | None = None) 
                 status_code=503,
             )
 
-        content: bytes | Any = (
-            _optimized_body(raw_body, status) if raw_body is not None else http_request.stream()
-        )
+        content: bytes | Any = raw_body if raw_body is not None else http_request.stream()
         target = status["serverUrl"].rstrip("/") + http_request.url.path
         if http_request.url.query:
             target += "?" + http_request.url.query

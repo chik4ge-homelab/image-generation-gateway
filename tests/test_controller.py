@@ -182,7 +182,7 @@ def test_openai_queue_reuses_the_ready_stable_diffusion_server_job():
     assert cluster.scales[-1][2] == 1
 
 
-def test_queued_generation_prompts_are_optimized_before_server_start():
+def test_openai_requests_never_start_the_prompt_optimizer():
     cluster = FakeCluster()
     first = make_cr("igr-openai-first")
     first["metadata"]["uid"] = "12345678-1234-1234-1234-123456789abc"
@@ -201,19 +201,11 @@ def test_queued_generation_prompts_are_optimized_before_server_start():
     assert cluster.get_request("images", first["metadata"]["name"])["status"]["phase"] == (
         "Prepared"
     )
-    assert cluster.get_request("images", second["metadata"]["name"])["status"]["phase"] == (
-        "Optimizing"
-    )
-    optimizer = optimizer_job_name(second["metadata"]["uid"])
-    cluster.jobs[("images", optimizer)]["status"] = {"succeeded": 1}
-    cluster.outputs[("images", optimizer)] = (
-        '{"rewritten_prompt":"expanded second prompt","wh_ratio":"1:1"}'
-    )
-
     assert controller.run_once()
     assert cluster.get_request("images", second["metadata"]["name"])["status"]["phase"] == (
         "Prepared"
     )
+    assert not any("optimizer" in key[1] for key in cluster.jobs)
     assert controller.run_once()
     assert cluster.get_request("images", first["metadata"]["name"])["status"]["phase"] == (
         "StartingServer"

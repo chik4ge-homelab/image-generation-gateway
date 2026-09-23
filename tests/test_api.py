@@ -14,11 +14,6 @@ class ProxyingCluster(FakeCluster):
     def create_request(self, namespace, body):
         result = super().create_request(namespace, body)
         status = {"phase": "Proxying", "serverUrl": "http://10.0.0.9:8080"}
-        if body["spec"].get("optimizePrompt"):
-            status["optimizer"] = {
-                "rewrittenPrompt": "an expanded prompt",
-                "whRatio": body["spec"].get("aspectRatio", "1:1"),
-            }
         result["status"] = status
         self.requests[(namespace, body["metadata"]["name"])] = result
         return result
@@ -40,7 +35,7 @@ def test_health_probes_and_custom_job_apis_are_absent():
         assert getattr(client, method)(path).status_code == 404
 
 
-def test_openai_generations_preserves_upstream_contract_and_optimizer(monkeypatch):
+def test_openai_generations_preserves_upstream_contract_and_prompt(monkeypatch):
     cluster = ProxyingCluster()
     forwarded = {}
 
@@ -91,7 +86,7 @@ def test_openai_generations_preserves_upstream_contract_and_optimizer(monkeypatc
     assert forwarded["content_length"] == str(len(forwarded["body"]))
     assert json.loads(forwarded["body"]) == {
         "model": "image-model",
-        "prompt": "an expanded prompt",
+        "prompt": "a fox in a forest",
         "size": "1792x1024",
         "n": 2,
         "response_format": "b64_json",
@@ -99,9 +94,8 @@ def test_openai_generations_preserves_upstream_contract_and_optimizer(monkeypatc
     }
     generated = next(iter(cluster.requests.values()))
     assert generated["spec"]["operation"] == "openai"
-    assert generated["spec"]["optimizePrompt"] is True
-    assert generated["spec"]["aspectRatio"] == "7:4"
     assert generated["spec"]["suspend"] is False
+    assert "prompt" not in generated["spec"]
 
 
 def test_openai_edits_streams_multipart_body_unchanged(monkeypatch):
@@ -148,7 +142,7 @@ def test_openai_edits_streams_multipart_body_unchanged(monkeypatch):
     assert forwarded["content_type"] == "multipart/form-data; boundary=image-boundary"
     generated = next(iter(cluster.requests.values()))
     assert generated["spec"]["operation"] == "openai"
-    assert generated["spec"]["optimizePrompt"] is False
+    assert "optimizePrompt" not in generated["spec"]
     assert "prompt" not in generated["spec"]
 
 
