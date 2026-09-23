@@ -8,10 +8,12 @@ from pathlib import Path
 
 MAX_OUTPUT_BYTES = 4096
 RATIOS = ("1:1", "3:2", "2:3", "16:9", "9:16")
-MAX_TOKENS = "1024"
-CONTEXT_SIZE = "2048"
+MAX_TOKENS = "512"
+CONTEXT_SIZE = "1024"
 GPU_LAYERS = "99"
 THREADS = "2"
+BATCH_SIZE = "128"
+UBATCH_SIZE = "128"
 TIMEOUT_SECONDS = 300
 
 
@@ -63,6 +65,7 @@ def main() -> None:
             MAX_TOKENS,
             "-c",
             CONTEXT_SIZE,
+            "--no-mmap",
             "-ngl",
             GPU_LAYERS,
             "-t",
@@ -74,9 +77,9 @@ def main() -> None:
             "-ctv",
             "q8_0",
             "-b",
-            "512",
+            BATCH_SIZE,
             "-ub",
-            "512",
+            UBATCH_SIZE,
             "--temp",
             "0",
             "--seed",

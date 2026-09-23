@@ -27,10 +27,12 @@ def test_optimizer_and_diffuser_support_the_same_ratios():
 
 def test_optimizer_has_bounded_gpu_inference():
     optimizer = _load("optimizer")
-    assert optimizer.MAX_TOKENS == "1024"
-    assert optimizer.CONTEXT_SIZE == "2048"
+    assert optimizer.MAX_TOKENS == "512"
+    assert optimizer.CONTEXT_SIZE == "1024"
     assert optimizer.GPU_LAYERS == "99"
     assert optimizer.THREADS == "2"
+    assert optimizer.BATCH_SIZE == "128"
+    assert optimizer.UBATCH_SIZE == "128"
     assert optimizer.TIMEOUT_SECONDS == 300
 
 
@@ -78,10 +80,15 @@ def test_optimizer_uses_llm_gateway_memory_tuning(monkeypatch):
 
     command = captured["command"]
     for pair in (
+        ("--no-mmap", "-ngl"),
         ("--flash-attn", "on"),
         ("-ctk", "q8_0"),
         ("-ctv", "q8_0"),
-        ("-b", "512"),
-        ("-ub", "512"),
+        ("-b", "128"),
+        ("-ub", "128"),
     ):
-        assert list(pair) == command[command.index(pair[0]) : command.index(pair[0]) + 2]
+        offset = command.index(pair[0])
+        if pair[0] == "--no-mmap":
+            assert command[offset + 1] == pair[1]
+        else:
+            assert list(pair) == command[offset : offset + 2]
