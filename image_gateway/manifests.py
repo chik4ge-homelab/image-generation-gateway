@@ -135,7 +135,7 @@ def _common_job(
         else:
             container["resources"] = {
                 "requests": {"cpu": "2", "memory": "4Gi", **gpu_resources},
-                "limits": {"memory": "12Gi", **gpu_resources},
+                "limits": {"memory": "13Gi", **gpu_resources},
             }
     return {
         "apiVersion": "batch/v1",
