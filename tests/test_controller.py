@@ -2,16 +2,13 @@ from datetime import UTC, datetime
 
 from image_gateway.config import Settings
 from image_gateway.controller import Controller
-from image_gateway.naming import diffuser_job_name, optimizer_job_name, server_job_name
+from image_gateway.naming import server_job_name
 
-from .conftest import FakeCluster, artifact_output, make_cr
+from .conftest import FakeCluster, make_cr
 
 
 def controller_settings():
-    return Settings(
-        namespace="images",
-        artifact_endpoint="https://objects.example.test",
-    )
+    return Settings(namespace="images")
 
 
 def test_fifo_claim_and_full_phase_transition():
@@ -19,32 +16,26 @@ def test_fifo_claim_and_full_phase_transition():
     cr = make_cr()
     cr["metadata"]["namespace"] = "images"
     cluster.requests[("images", cr["metadata"]["name"])] = cr
+    job_name = server_job_name(cr["metadata"]["uid"])
+    cluster.job_endpoints[("images", job_name)] = "http://10.1.2.3:8080"
     controller = Controller(cluster, controller_settings())
 
     assert controller.run_once() is True
-    assert cluster.get_request("images", cr["metadata"]["name"])["status"]["phase"] == "Optimizing"
-
-    assert controller.run_once() is True
-    optimizer_name = optimizer_job_name(cr["metadata"]["uid"])
-    cluster.jobs[("images", optimizer_name)]["status"] = {"succeeded": 1}
-    cluster.outputs[("images", optimizer_name)] = '{"rewritten_prompt":"a cat","wh_ratio":"1:1"}'
-
-    assert controller.run_once() is True
-    assert cluster.get_request("images", cr["metadata"]["name"])["status"]["phase"] == "Generating"
-
-    assert controller.run_once() is True
-    diffuser_name = diffuser_job_name(cr["metadata"]["uid"])
-    cluster.jobs[("images", diffuser_name)]["status"] = {"succeeded": 1}
-    cluster.outputs[("images", diffuser_name)] = artifact_output()
+    assert cluster.get_request("images", cr["metadata"]["name"])["status"]["phase"] == "Prepared"
 
     assert controller.run_once() is True
     assert (
-        cluster.get_request("images", cr["metadata"]["name"])["status"]["phase"] == "RestoringText"
+        cluster.get_request("images", cr["metadata"]["name"])["status"]["phase"]
+        == "StartingServer"
     )
+
+    assert controller.run_once() is True
+    assert cluster.get_request("images", cr["metadata"]["name"])["status"]["phase"] == "Proxying"
+    cluster.patch_request_status("images", cr["metadata"]["name"], {"phase": "RestoringText"})
+
     assert controller.run_once() is True
     result = cluster.get_request("images", cr["metadata"]["name"])
     assert result["status"]["phase"] == "Succeeded"
-    assert result["status"]["artifact"]["contentType"] == "image/png"
     assert cluster.scales[0][2] == 0
     assert cluster.scales[-1][2] == 1
 
@@ -71,7 +62,7 @@ def test_fifo_claims_only_the_oldest_ready_request():
     assert Controller(cluster, controller_settings()).run_once() is True
 
     assert cluster.get_request("images", oldest["metadata"]["name"])["status"]["phase"] == (
-        "Optimizing"
+        "Prepared"
     )
     assert "status" not in cluster.get_request("images", newest["metadata"]["name"])
 
@@ -94,18 +85,18 @@ def test_active_request_blocks_an_older_pending_request():
     active = make_cr("igr-active")
     active["metadata"]["uid"] = "87654321-4321-4321-4321-cba987654321"
     active["metadata"]["creationTimestamp"] = "2026-01-01T00:01:00Z"
-    active["status"] = {
-        "phase": "Generating",
-        "optimizer": {"rewrittenPrompt": "a cat", "whRatio": "1:1"},
-    }
+    active_job_name = server_job_name(active["metadata"]["uid"])
+    active["status"] = {"phase": "Proxying", "serverJobName": active_job_name}
     cluster.requests[("images", pending["metadata"]["name"])] = pending
     cluster.requests[("images", active["metadata"]["name"])] = active
+    cluster.jobs[("images", active_job_name)] = {"status": {}}
 
     assert Controller(cluster, controller_settings()).run_once() is True
 
     assert "status" not in cluster.get_request("images", pending["metadata"]["name"])
-    assert cluster.get_request("images", active["metadata"]["name"])["status"]["phase"] == (
-        "Generating"
+    assert (
+        cluster.get_request("images", active["metadata"]["name"])["status"]["phase"]
+        == "Proxying"
     )
 
 
@@ -133,11 +124,9 @@ def test_openai_queue_reuses_the_ready_stable_diffusion_server_job():
     first = make_cr("igr-openai-first")
     first["metadata"]["uid"] = "12345678-1234-1234-1234-123456789abc"
     first["metadata"]["creationTimestamp"] = "2026-01-01T00:00:00Z"
-    first["spec"].update({"operation": "openai", "optimizePrompt": False, "prompt": None})
     second = make_cr("igr-openai-second")
     second["metadata"]["uid"] = "87654321-4321-4321-4321-cba987654321"
     second["metadata"]["creationTimestamp"] = "2026-01-01T00:01:00Z"
-    second["spec"].update({"operation": "openai", "optimizePrompt": False, "prompt": None})
     cluster.requests[("images", first["metadata"]["name"])] = first
     cluster.requests[("images", second["metadata"]["name"])] = second
     server_name = server_job_name(first["metadata"]["uid"])
@@ -183,17 +172,15 @@ def test_openai_queue_reuses_the_ready_stable_diffusion_server_job():
     assert cluster.scales[-1][2] == 1
 
 
-def test_openai_requests_never_start_the_prompt_optimizer():
+def test_fifo_requests_are_prepared_before_the_server_starts():
     cluster = FakeCluster()
     first = make_cr("igr-openai-first")
     first["metadata"]["uid"] = "12345678-1234-1234-1234-123456789abc"
     first["metadata"]["creationTimestamp"] = "2026-01-01T00:00:00Z"
-    first["spec"].update({"operation": "openai", "optimizePrompt": False})
     first["status"] = {"phase": "Prepared", "startedAt": "2026-01-01T00:00:00Z"}
     second = make_cr("igr-openai-second")
     second["metadata"]["uid"] = "87654321-4321-4321-4321-cba987654321"
     second["metadata"]["creationTimestamp"] = "2026-01-01T00:01:00Z"
-    second["spec"].update({"operation": "openai", "optimizePrompt": True})
     cluster.requests[("images", first["metadata"]["name"])] = first
     cluster.requests[("images", second["metadata"]["name"])] = second
     controller = Controller(cluster, controller_settings())
@@ -206,32 +193,28 @@ def test_openai_requests_never_start_the_prompt_optimizer():
     assert cluster.get_request("images", second["metadata"]["name"])["status"]["phase"] == (
         "Prepared"
     )
-    assert not any("optimizer" in key[1] for key in cluster.jobs)
+    assert not cluster.jobs
     assert controller.run_once()
     assert cluster.get_request("images", first["metadata"]["name"])["status"]["phase"] == (
         "StartingServer"
     )
 
 
-def test_completed_untracked_request_is_deleted_with_owned_temporary_resources():
+def test_completed_untracked_request_is_deleted():
     cluster = FakeCluster()
-    cr = make_cr("igr-artifact-complete")
+    cr = make_cr("igr-complete")
     cr["status"] = {"phase": "Succeeded"}
     cluster.requests[("images", cr["metadata"]["name"])] = cr
-    cluster.configmaps[("images", "request-input")] = {
-        "metadata": {"ownerReferences": [{"uid": cr["metadata"]["uid"]}]}
-    }
 
     assert Controller(cluster, controller_settings()).run_once()
 
     assert ("images", cr["metadata"]["name"]) in cluster.deleted_requests
     assert ("images", cr["metadata"]["name"]) not in cluster.requests
-    assert ("images", "request-input") not in cluster.configmaps
 
 
 def test_old_failed_untracked_request_is_deleted_after_retention():
     cluster = FakeCluster()
-    cr = make_cr("igr-artifact-failed")
+    cr = make_cr("igr-failed")
     cr["status"] = {"phase": "Failed", "completedAt": "2020-01-01T00:00:00Z"}
     cluster.requests[("images", cr["metadata"]["name"])] = cr
 
@@ -241,7 +224,7 @@ def test_old_failed_untracked_request_is_deleted_after_retention():
 
 def test_recent_failed_untracked_request_is_retained_for_error_response():
     cluster = FakeCluster()
-    cr = make_cr("igr-artifact-failed-recent")
+    cr = make_cr("igr-failed-recent")
     cr["status"] = {
         "phase": "Failed",
         "completedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -271,11 +254,9 @@ def test_terminal_argocd_managed_requests_are_not_deleted():
 def test_openai_request_owning_shared_server_waits_for_other_requests():
     cluster = FakeCluster()
     first = make_cr("igr-openai-complete")
-    first["spec"].update({"operation": "openai", "suspend": False})
     first["status"] = {"phase": "Succeeded", "serverJobName": "shared-server"}
     second = make_cr("igr-openai-active")
     second["metadata"]["uid"] = "87654321-4321-4321-4321-cba987654321"
-    second["spec"].update({"operation": "openai", "suspend": False})
     second["status"] = {"phase": "Proxying", "serverJobName": "shared-server"}
     cluster.requests[("images", first["metadata"]["name"])] = first
     cluster.requests[("images", second["metadata"]["name"])] = second

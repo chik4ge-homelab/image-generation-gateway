@@ -16,21 +16,5 @@ def uid_name(prefix: str, uid: str) -> str:
     return f"{prefix}-{safe_uid}"[:63].rstrip("-")
 
 
-def optimizer_job_name(uid: str) -> str:
-    return uid_name("igr-opt", uid)
-
-
-def diffuser_job_name(uid: str) -> str:
-    return uid_name("igr-diff", uid)
-
-
 def server_job_name(uid: str) -> str:
     return uid_name("igr-server", uid)
-
-
-def optimizer_configmap_name(uid: str) -> str:
-    return uid_name("igr-opt-input", uid)
-
-
-def diffuser_configmap_name(uid: str) -> str:
-    return uid_name("igr-diff-input", uid)

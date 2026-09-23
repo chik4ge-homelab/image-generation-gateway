@@ -8,7 +8,6 @@ version = "0.1.0"
 description = "CPU API and single-GPU Kubernetes controller for image generation requests"
 requires-python = ">=3.12"
 dependencies = [
-  "boto3>=1.35,<2",
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",
   "kubernetes>=31,<34",

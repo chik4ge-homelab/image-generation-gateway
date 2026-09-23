@@ -7,23 +7,9 @@ from typing import Any
 
 from .cluster import ConflictError, NotFoundError
 from .config import Settings
-from .manifests import (
-    DIFFUSER_CRONJOB_NAME,
-    OPTIMIZER_CRONJOB_NAME,
-    SERVER_CRONJOB_NAME,
-    diffuser_configmap,
-    job_from_cronjob,
-    optimizer_configmap,
-)
+from .manifests import SERVER_CRONJOB_NAME, job_from_cronjob
 from .models import TERMINAL_PHASES
-from .naming import (
-    diffuser_configmap_name,
-    diffuser_job_name,
-    optimizer_configmap_name,
-    optimizer_job_name,
-    server_job_name,
-)
-from .validation import StrictJSONError, parse_artifact_output, parse_optimizer_output
+from .naming import server_job_name
 
 LOGGER = logging.getLogger(__name__)
 FAILED_OPENAI_REQUEST_RETENTION_SECONDS = 60
@@ -31,7 +17,6 @@ FAILED_OPENAI_REQUEST_RETENTION_SECONDS = 60
 
 class Controller:
     def __init__(self, cluster: Any, settings: Settings):
-        settings.validate_controller()
         self.cluster = cluster
         self.settings = settings
 
@@ -147,13 +132,6 @@ class Controller:
         phase = cr.get("status", {}).get("phase", "Pending")
         if phase == "StoppingText":
             self._stopping_text(cr)
-        elif phase == "Optimizing":
-            if cr.get("spec", {}).get("operation") == "openai":
-                self._patch_phase(cr, "Prepared")
-            else:
-                self._optimizing(cr)
-        elif phase == "Generating":
-            self._generating(cr)
         elif phase == "Prepared":
             self._prepared(cr)
         elif phase == "StartingServer":
@@ -171,12 +149,7 @@ class Controller:
             if self.cluster.llm_pods_gone(
                 self.settings.llm_namespace, self.settings.llm_deployment_name
             ):
-                next_phase = (
-                    "Prepared"
-                    if cr.get("spec", {}).get("operation") == "openai"
-                    else "Optimizing"
-                )
-                self._patch_phase(cr, next_phase)
+                self._patch_phase(cr, "Prepared")
             elif self._phase_timed_out(cr):
                 self._fail(
                     cr,
@@ -186,46 +159,6 @@ class Controller:
                 )
         except Exception as exc:
             self._fail(cr, "StoppingText", "LlmScaleDownFailed", str(exc))
-
-    def _optimizing(self, cr: dict[str, Any]) -> None:
-        name = cr["metadata"]["name"]
-        uid = cr["metadata"]["uid"]
-        try:
-            config_name = optimizer_configmap_name(uid)
-            self._ensure_configmap(optimizer_configmap(cr, self.settings), config_name)
-            job_name = optimizer_job_name(uid)
-            job = self._ensure_template_job(
-                cr, OPTIMIZER_CRONJOB_NAME, job_name, config_name
-            )
-            outcome = self._job_outcome(job)
-            if outcome == "running":
-                return
-            if outcome == "failed":
-                self._fail(cr, "Optimizing", "OptimizerJobFailed", "optimizer Job failed")
-                return
-            output = self.cluster.read_job_output(self.settings.namespace, job_name)
-            if not output:
-                self._fail(cr, "Optimizing", "OptimizerOutputMissing", "optimizer output was empty")
-                return
-            result = parse_optimizer_output(output)
-            next_phase = (
-                "Prepared" if cr.get("spec", {}).get("operation") == "openai" else "Generating"
-            )
-            self.cluster.patch_request_status(
-                self.settings.namespace,
-                name,
-                {
-                    "phase": next_phase,
-                    "optimizer": {
-                        "rewrittenPrompt": result.rewritten_prompt,
-                        "whRatio": result.wh_ratio,
-                    },
-                },
-            )
-        except (StrictJSONError, ValueError) as exc:
-            self._fail(cr, "Optimizing", "InvalidOptimizerOutput", str(exc))
-        except Exception as exc:
-            self._fail(cr, "Optimizing", "OptimizerReconcileFailed", str(exc))
 
     def _prepared(self, cr: dict[str, Any]) -> None:
         requests = sorted(
@@ -244,7 +177,7 @@ class Controller:
             ),
             None,
         )
-        if queued and queued.get("spec", {}).get("operation") == "openai":
+        if queued:
             try:
                 self.cluster.patch_request_status(
                     self.settings.namespace,
@@ -261,7 +194,7 @@ class Controller:
         name = cr["metadata"]["name"]
         try:
             job_name = server_job_name(cr["metadata"]["uid"])
-            job = self._ensure_template_job(cr, SERVER_CRONJOB_NAME, job_name, None)
+            job = self._ensure_template_job(cr, SERVER_CRONJOB_NAME, job_name)
             outcome = self._job_outcome(job)
             if outcome in {"failed", "succeeded"}:
                 self._fail(
@@ -313,62 +246,6 @@ class Controller:
         except Exception as exc:
             self._fail(cr, "Proxying", "ServerStateReadFailed", str(exc))
 
-    def _generating(self, cr: dict[str, Any]) -> None:
-        name = cr["metadata"]["name"]
-        uid = cr["metadata"]["uid"]
-        optimizer = cr.get("status", {}).get("optimizer", {})
-        rewritten_prompt = optimizer.get("rewrittenPrompt")
-        wh_ratio = optimizer.get("whRatio")
-        if not rewritten_prompt or not wh_ratio:
-            self._fail(
-                cr, "Generating", "OptimizerStateMissing", "validated optimizer state is missing"
-            )
-            return
-        try:
-            config_name = diffuser_configmap_name(uid)
-            self._ensure_configmap(
-                diffuser_configmap(cr, self.settings, rewritten_prompt, wh_ratio), config_name
-            )
-            job_name = diffuser_job_name(uid)
-            job = self._ensure_template_job(
-                cr, DIFFUSER_CRONJOB_NAME, job_name, config_name
-            )
-            outcome = self._job_outcome(job)
-            if outcome == "running":
-                return
-            if outcome == "failed":
-                self._fail(cr, "Generating", "DiffuserJobFailed", "diffuser Job failed")
-                return
-            output = self.cluster.read_job_output(self.settings.namespace, job_name)
-            if not output:
-                self._fail(cr, "Generating", "ArtifactOutputMissing", "diffuser output was empty")
-                return
-            artifact = parse_artifact_output(output)
-            artifact_dict = {
-                "key": artifact.key,
-                "sha256": artifact.sha256.lower(),
-                "contentType": artifact.content_type,
-                "width": artifact.width,
-                "height": artifact.height,
-            }
-            if not self.cluster.verify_artifact(self.settings.artifact_endpoint, artifact_dict):
-                self._fail(
-                    cr,
-                    "Generating",
-                    "ArtifactVerificationFailed",
-                    "artifact checksum verification failed",
-                )
-                return
-            self.cluster.patch_request_status(
-                self.settings.namespace,
-                name,
-                {"phase": "RestoringText", "artifact": artifact_dict},
-            )
-        except (StrictJSONError, ValueError) as exc:
-            self._fail(cr, "Generating", "InvalidArtifactOutput", str(exc))
-        except Exception as exc:
-            self._fail(cr, "Generating", "GenerationReconcileFailed", str(exc))
-
     def _restoring_text(self, cr: dict[str, Any]) -> None:
         try:
             status = cr.get("status", {})
@@ -410,7 +287,7 @@ class Controller:
         status = cr.get("status", {})
         server_url = status.get("serverUrl")
         server_job = status.get("serverJobName")
-        if cr.get("spec", {}).get("operation") != "openai" or not server_url or not server_job:
+        if not server_url or not server_job:
             return False
         requests = sorted(
             self.cluster.list_requests(self.settings.namespace),
@@ -428,7 +305,7 @@ class Controller:
             ),
             None,
         )
-        if not queued or queued.get("spec", {}).get("operation") != "openai":
+        if not queued:
             return False
         next_status: dict[str, Any] = {
             "phase": "Proxying",
@@ -454,30 +331,15 @@ class Controller:
             for request in self.cluster.list_requests(self.settings.namespace)
         )
 
-    def _ensure_configmap(self, manifest: dict[str, Any], name: str) -> None:
-        try:
-            self.cluster.get_configmap(self.settings.namespace, name)
-        except NotFoundError:
-            try:
-                self.cluster.create_configmap(self.settings.namespace, manifest)
-            except ConflictError:
-                pass
-
     def _ensure_template_job(
-        self, cr: dict[str, Any], cronjob_name: str, name: str, configmap_name: str | None
+        self, cr: dict[str, Any], cronjob_name: str, name: str
     ) -> dict[str, Any]:
         try:
             return self.cluster.get_job(self.settings.namespace, name)
         except NotFoundError:
             try:
                 cronjob = self.cluster.get_cronjob(self.settings.namespace, cronjob_name)
-                manifest = job_from_cronjob(
-                    cr,
-                    self.settings,
-                    cronjob,
-                    name=name,
-                    configmap_name=configmap_name,
-                )
+                manifest = job_from_cronjob(cr, cronjob, name=name)
                 return self.cluster.create_job(self.settings.namespace, manifest)
             except ConflictError:
                 return self.cluster.get_job(self.settings.namespace, name)
@@ -535,7 +397,6 @@ class Controller:
                 self.cluster.wait_job_pods_gone(self.settings.namespace, server_job, 120)
             keep_llm_stopped = any(
                 request["metadata"]["name"] != cr["metadata"]["name"]
-                and request.get("spec", {}).get("operation") == "openai"
                 and request.get("status", {}).get("phase") in {"Prepared", "StartingServer"}
                 for request in self.cluster.list_requests(self.settings.namespace)
             )

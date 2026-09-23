@@ -92,7 +92,7 @@ def test_openai_generations_preserves_upstream_contract_and_prompt(monkeypatch):
         "extra_upstream_field": {"preserve": True},
     }
     generated = next(iter(cluster.requests.values()))
-    assert generated["spec"]["operation"] == "openai"
+    assert set(generated["spec"]) == {"idempotencyKey", "suspend"}
     assert generated["spec"]["suspend"] is False
     assert not any(
         key.startswith("argocd.argoproj.io/")
@@ -143,7 +143,7 @@ def test_openai_edits_streams_multipart_body_unchanged(monkeypatch):
     assert forwarded["body"] == multipart_body
     assert forwarded["content_type"] == "multipart/form-data; boundary=image-boundary"
     generated = next(iter(cluster.requests.values()))
-    assert generated["spec"]["operation"] == "openai"
+    assert set(generated["spec"]) == {"idempotencyKey", "suspend"}
     assert "optimizePrompt" not in generated["spec"]
     assert "prompt" not in generated["spec"]
 

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 
 from image_gateway.cluster import ConflictError, NotFoundError
 
@@ -10,14 +8,10 @@ from image_gateway.cluster import ConflictError, NotFoundError
 class FakeCluster:
     def __init__(self):
         self.requests = {}
-        self.configmaps = {}
         self.jobs = {}
         self.cronjobs = {
-            ("images", "image-generation-optimizer"): make_cronjob_template("optimizer"),
-            ("images", "image-generation-diffuser"): make_cronjob_template("diffuser"),
-            ("images", "image-generation-server"): make_cronjob_template("server"),
+            ("images", "image-generation-server"): make_cronjob_template(),
         }
-        self.outputs = {}
         self.scales = []
         self.deleted_jobs = set()
         self.deleted_requests = set()
@@ -72,11 +66,10 @@ class FakeCluster:
             return
         self.deleted_requests.add((namespace, name))
         uid = request["metadata"].get("uid")
-        for resources in (self.configmaps, self.jobs):
-            for key, resource in list(resources.items()):
-                owners = resource.get("metadata", {}).get("ownerReferences", [])
-                if any(owner.get("uid") == uid for owner in owners):
-                    resources.pop(key)
+        for key, resource in list(self.jobs.items()):
+            owners = resource.get("metadata", {}).get("ownerReferences", [])
+            if any(owner.get("uid") == uid for owner in owners):
+                self.jobs.pop(key)
 
     def patch_request_status(self, namespace, name, status, resource_version=None):
         result = self.get_request(namespace, name)
@@ -90,19 +83,6 @@ class FakeCluster:
         self._rv += 1
         self.requests[(namespace, name)] = result
         return copy.deepcopy(result)
-
-    def get_configmap(self, namespace, name):
-        try:
-            return copy.deepcopy(self.configmaps[(namespace, name)])
-        except KeyError as exc:
-            raise NotFoundError(name) from exc
-
-    def create_configmap(self, namespace, body):
-        key = (namespace, body["metadata"]["name"])
-        if key in self.configmaps:
-            raise ConflictError(body["metadata"]["name"])
-        self.configmaps[key] = copy.deepcopy(body)
-        return copy.deepcopy(body)
 
     def get_job(self, namespace, name):
         try:
@@ -146,16 +126,6 @@ class FakeCluster:
     def wait_llm_ready(self, namespace, name, timeout_seconds):
         return True
 
-    def read_job_output(self, namespace, job_name):
-        return self.outputs.get((namespace, job_name))
-
-    def verify_artifact(self, endpoint, artifact):
-        return True
-
-    def artifact_url(self, endpoint, artifact):
-        return endpoint.rstrip("/") + "/" + artifact["key"]
-
-
 def make_cr(name="igr-test"):
     return {
         "apiVersion": "homelab.chik4ge.me/v1alpha1",
@@ -169,65 +139,26 @@ def make_cr(name="igr-test"):
         },
         "spec": {
             "idempotencyKey": "key",
-            "prompt": "a cat",
-            "aspectRatio": "1:1",
-            "steps": 40,
-            "seed": 42,
             "suspend": False,
         },
     }
 
 
-def make_cronjob_template(worker):
-    is_optimizer = worker == "optimizer"
-    is_server = worker == "server"
-    volumes = [
-        {
-            "name": "models",
-            "persistentVolumeClaim": {"claimName": "image-generation-models"},
-        }
-    ]
-    if not is_server:
-        volumes.insert(
-            0,
-            {
-                "name": "input",
-                "configMap": {
-                    "name": f"image-generation-{worker}-input-template",
-                    "items": [{"key": "input.json", "path": "input.json"}],
-                },
-            },
-        )
+def make_cronjob_template():
     container = {
-        "name": worker,
-        "image": f"{worker}:test",
-        "args": ["--input", "/inputs/input.json"] if not is_server else ["--listen-port", "8080"],
-        "env": [{"name": "MODEL_PATH", "value": "/models/model.gguf"}],
+        "name": "sd-server",
+        "image": "stable-diffusion:test",
+        "args": ["--listen-port", "8080"],
         "resources": {
-            "requests": {
-                "memory": "4Gi" if is_optimizer else "6Gi",
-                "nvidia.com/gpu": "1",
-            },
-            "limits": {
-                "memory": "4Gi" if is_optimizer else "12Gi",
-                "nvidia.com/gpu": "1",
-            },
+            "requests": {"memory": "6Gi", "nvidia.com/gpu": "1"},
+            "limits": {"memory": "12Gi", "nvidia.com/gpu": "1"},
         },
-        "volumeMounts": [
-            *(
-                [{"name": "input", "mountPath": "/inputs", "readOnly": True}]
-                if not is_server
-                else []
-            ),
-            {"name": "models", "mountPath": "/models", "readOnly": True},
-        ],
+        "volumeMounts": [{"name": "models", "mountPath": "/models", "readOnly": True}],
     }
-    if not is_optimizer:
-        container["envFrom"] = [{"secretRef": {"name": "artifacts"}}]
     return {
         "apiVersion": "batch/v1",
         "kind": "CronJob",
-        "metadata": {"name": f"image-generation-{worker}"},
+        "metadata": {"name": "image-generation-server"},
         "spec": {
             "suspend": True,
             "jobTemplate": {
@@ -242,24 +173,18 @@ def make_cronjob_template(worker):
                             "restartPolicy": "Never",
                             "serviceAccountName": "image-generation-job",
                             "runtimeClassName": "nvidia",
-                                    "containers": [container],
-                                    "volumes": volumes,
+                            "containers": [container],
+                            "volumes": [
+                                {
+                                    "name": "models",
+                                    "persistentVolumeClaim": {
+                                        "claimName": "image-generation-models"
+                                    },
+                                }
+                            ],
                         },
                     },
                 },
             },
         },
     }
-
-
-def artifact_output():
-    data = b"image-bytes"
-    return json.dumps(
-        {
-            "key": "image-generation/igr-test.png",
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "content_type": "image/png",
-            "width": 512,
-            "height": 512,
-        }
-    )

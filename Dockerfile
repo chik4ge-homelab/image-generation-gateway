@@ -11,13 +11,3 @@ USER app
 
 ENTRYPOINT ["image-gateway"]
 CMD ["api"]
-
-FROM ghcr.io/leejet/stable-diffusion.cpp:master-cuda@sha256:b0b24683e7020cdb2f5c0e36805abde9b9c6ae1eda6f9d305c73b07eabc3669a AS diffuser
-
-RUN DEBIAN_FRONTEND=noninteractive apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip \
-    && python3 -m pip install --break-system-packages --no-cache-dir boto3 \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY workers/diffuser.py /usr/local/bin/image-diffuser
-ENTRYPOINT ["python3", "/usr/local/bin/image-diffuser"]

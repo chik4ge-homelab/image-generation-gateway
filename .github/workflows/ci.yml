@@ -28,7 +28,6 @@ jobs:
       matrix:
         target:
           - gateway
-          - diffuser
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3

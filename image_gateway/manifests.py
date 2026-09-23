@@ -1,20 +1,11 @@
 from __future__ import annotations
 
-import json
 from copy import deepcopy
 from typing import Any
-
-from .config import Settings
-from .naming import (
-    diffuser_configmap_name,
-    optimizer_configmap_name,
-)
 
 GROUP = "homelab.chik4ge.me"
 VERSION = "v1alpha1"
 KIND = "ImageGenerationRequest"
-OPTIMIZER_CRONJOB_NAME = "image-generation-optimizer"
-DIFFUSER_CRONJOB_NAME = "image-generation-diffuser"
 SERVER_CRONJOB_NAME = "image-generation-server"
 
 
@@ -30,69 +21,11 @@ def owner_reference(cr: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _input_configmap(
-    name: str,
-    namespace: str,
-    owner: dict[str, Any],
-    payload: dict[str, Any],
-    settings: Settings,
-) -> dict[str, Any]:
-    return {
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "ownerReferences": [owner],
-            "labels": {"app.kubernetes.io/part-of": "image-generation"},
-        },
-        "data": {"input.json": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
-    }
-
-
-def optimizer_configmap(cr: dict[str, Any], settings: Settings) -> dict[str, Any]:
-    spec = cr["spec"]
-    return _input_configmap(
-        optimizer_configmap_name(cr["metadata"]["uid"]),
-        cr["metadata"]["namespace"],
-        owner_reference(cr),
-        {
-            "prompt": spec["prompt"],
-            "aspect_ratio": spec.get("aspectRatio", "1:1"),
-            "steps": spec.get("steps", 40),
-            "seed": spec.get("seed", 42),
-        },
-        settings,
-    )
-
-
-def diffuser_configmap(
-    cr: dict[str, Any], settings: Settings, rewritten_prompt: str, wh_ratio: str
-) -> dict[str, Any]:
-    spec = cr["spec"]
-    key = f"{settings.artifact_prefix.rstrip('/')}/{cr['metadata']['name']}.png"
-    return _input_configmap(
-        diffuser_configmap_name(cr["metadata"]["uid"]),
-        cr["metadata"]["namespace"],
-        owner_reference(cr),
-        {
-            "prompt": rewritten_prompt,
-            "wh_ratio": wh_ratio,
-            "steps": spec.get("steps", 40),
-            "seed": spec.get("seed", 42),
-            "artifact_key": key,
-        },
-        settings,
-    )
-
-
 def job_from_cronjob(
     cr: dict[str, Any],
-    settings: Settings,
     cronjob: dict[str, Any],
     *,
     name: str,
-    configmap_name: str | None,
 ) -> dict[str, Any]:
     cronjob_spec = cronjob.get("spec", {})
     if cronjob_spec.get("suspend") is not True:
@@ -102,24 +35,6 @@ def job_from_cronjob(
     namespace = cr["metadata"]["namespace"]
     job_template = cronjob_spec.get("jobTemplate", {})
     job_spec = deepcopy(job_template.get("spec", {}))
-    pod_spec = job_spec.get("template", {}).get("spec", {})
-    input_volume = next(
-        (
-            volume
-            for volume in pod_spec.get("volumes", [])
-            if volume.get("name") == "input" and "configMap" in volume
-        ),
-        None,
-    )
-    if configmap_name is None:
-        if input_volume is not None:
-            template_name = cronjob.get("metadata", {}).get("name")
-            raise ValueError(f"CronJob template {template_name} unexpectedly has an input volume")
-    elif input_volume is None:
-        template_name = cronjob.get("metadata", {}).get("name")
-        raise ValueError(f"CronJob template {template_name} has no input volume")
-    else:
-        input_volume["configMap"]["name"] = configmap_name
 
     labels = deepcopy(job_template.get("metadata", {}).get("labels", {}))
     labels.update({"app.kubernetes.io/part-of": "image-generation", "image-job": name})

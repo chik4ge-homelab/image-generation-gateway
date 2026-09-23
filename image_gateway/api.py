@@ -129,7 +129,6 @@ def create_app(*, cluster: Any | None = None, settings: Settings | None = None) 
         name = request_name(request_id)
         spec: dict[str, Any] = {
             "idempotencyKey": request_id,
-            "operation": "openai",
             "suspend": False,
         }
         body = {

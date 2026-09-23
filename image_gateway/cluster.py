@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import time
 from typing import Any
-from urllib.parse import quote
-from urllib.request import Request, urlopen
 
 
 class ClusterError(RuntimeError):
@@ -128,20 +125,6 @@ class KubernetesCluster:
         except Exception as exc:
             raise self._api_error(exc) from exc
 
-    def get_configmap(self, namespace: str, name: str) -> dict[str, Any]:
-        try:
-            obj = self.core.read_namespaced_config_map(name, namespace)
-            return self._serialize(obj)
-        except Exception as exc:
-            raise self._api_error(exc) from exc
-
-    def create_configmap(self, namespace: str, body: dict[str, Any]) -> dict[str, Any]:
-        try:
-            obj = self.core.create_namespaced_config_map(namespace, body)
-            return self._serialize(obj)
-        except Exception as exc:
-            raise self._api_error(exc) from exc
-
     def get_job(self, namespace: str, name: str) -> dict[str, Any]:
         try:
             obj = self.batch.read_namespaced_job(name, namespace)
@@ -257,105 +240,6 @@ class KubernetesCluster:
                 return True
             time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
         return self.llm_ready(namespace, name)
-
-    def read_job_output(self, namespace: str, job_name: str) -> str | None:
-        try:
-            pods = self.core.list_namespaced_pod(namespace, label_selector=f"job-name={job_name}")
-            for pod in getattr(pods, "items", []):
-                pod_dict = self._serialize(pod)
-                statuses = pod_dict.get("status", {}).get("containerStatuses", [])
-                for container in statuses:
-                    terminated = container.get("state", {}).get("terminated")
-                    if terminated and terminated.get("message"):
-                        return terminated["message"]
-            return None
-        except Exception as exc:
-            raise self._api_error(exc) from exc
-
-    def verify_artifact(self, endpoint: str, artifact: dict[str, Any]) -> bool:
-        if all(
-            os.getenv(name)
-            for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "BUCKET_NAME")
-        ):
-            return self._verify_s3_artifact(endpoint, artifact)
-        return self._verify_http_artifact(endpoint, artifact)
-
-    def artifact_url(self, endpoint: str, artifact: dict[str, Any]) -> str:
-        if all(
-            os.getenv(name)
-            for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "BUCKET_NAME")
-        ):
-            endpoint_url = os.getenv("AWS_ENDPOINT_URL_S3") or os.getenv(
-                "AWS_ENDPOINT_URL"
-            ) or endpoint
-            client = self._s3_client(endpoint_url)
-            return client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": os.environ["BUCKET_NAME"], "Key": artifact["key"]},
-                ExpiresIn=900,
-            )
-        return endpoint.rstrip("/") + "/" + quote(artifact["key"], safe="/")
-
-    @staticmethod
-    def _s3_client(endpoint_url: str):
-        import boto3
-
-        return boto3.client(
-            "s3",
-            endpoint_url=endpoint_url,
-            region_name=os.getenv("BUCKET_REGION") or "us-east-1",
-            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-        )
-
-    @staticmethod
-    def _verify_s3_artifact(endpoint: str, artifact: dict[str, Any]) -> bool:
-        endpoint_url = os.getenv("AWS_ENDPOINT_URL_S3") or os.getenv("AWS_ENDPOINT_URL") or endpoint
-        if not endpoint_url:
-            host = os.getenv("BUCKET_HOST")
-            port = os.getenv("BUCKET_PORT")
-            if not host:
-                return False
-            endpoint_url = (
-                host
-                if host.startswith("http://") or host.startswith("https://")
-                else f"http://{host}"
-            )
-            if port and "://" in endpoint_url and endpoint_url.rsplit(":", 1)[-1] != port:
-                endpoint_url = f"{endpoint_url}:{port}"
-        try:
-            client = KubernetesCluster._s3_client(endpoint_url)
-            response = client.get_object(Bucket=os.environ["BUCKET_NAME"], Key=artifact["key"])
-            digest = hashlib.sha256()
-            total = 0
-            body = response["Body"]
-            while chunk := body.read(1024 * 1024):
-                total += len(chunk)
-                if total > 256 * 1024 * 1024:
-                    return False
-                digest.update(chunk)
-            return digest.hexdigest().lower() == artifact["sha256"].lower()
-        except Exception:
-            return False
-
-    @staticmethod
-    def _verify_http_artifact(endpoint: str, artifact: dict[str, Any]) -> bool:
-        url = endpoint.rstrip("/") + "/" + quote(artifact["key"], safe="/")
-        request = Request(url, method="GET")
-        try:
-            with urlopen(request, timeout=15) as response:
-                if not 200 <= response.status < 300:
-                    return False
-                digest = hashlib.sha256()
-                total = 0
-                while chunk := response.read(1024 * 1024):
-                    total += len(chunk)
-                    if total > 256 * 1024 * 1024:
-                        return False
-                    digest.update(chunk)
-                return digest.hexdigest().lower() == artifact["sha256"].lower()
-        except Exception:
-            return False
 
     @staticmethod
     def _serialize(value: Any) -> dict[str, Any]:

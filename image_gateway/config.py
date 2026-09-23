@@ -7,8 +7,6 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Settings:
     namespace: str = "default"
-    artifact_endpoint: str = ""
-    artifact_prefix: str = "image-generation"
     llm_namespace: str = "llm-gateway"
     llm_deployment_name: str = "llama-cpp"
     llm_pod_label_selector: str = "app.kubernetes.io/name=llm-gateway"
@@ -24,8 +22,6 @@ class Settings:
     def from_env(cls) -> Settings:
         return cls(
             namespace=os.getenv("IMAGE_NAMESPACE", cls.namespace),
-            artifact_endpoint=os.getenv("ARTIFACT_ENDPOINT", ""),
-            artifact_prefix=os.getenv("ARTIFACT_PREFIX", cls.artifact_prefix),
             llm_namespace=os.getenv("LLM_NAMESPACE", cls.llm_namespace),
             llm_deployment_name=os.getenv("LLM_DEPLOYMENT_NAME", cls.llm_deployment_name),
             llm_pod_label_selector=os.getenv(
@@ -51,14 +47,3 @@ class Settings:
             llm_gateway_api_key=os.getenv("LLM_GATEWAY_API_KEY", ""),
             port=int(os.getenv("IMAGE_GATEWAY_PORT", str(cls.port))),
         )
-
-    def validate_controller(self) -> None:
-        missing = [
-            name
-            for name, value in (
-                ("ARTIFACT_ENDPOINT", self.artifact_endpoint),
-            )
-            if not value
-        ]
-        if missing:
-            raise ValueError("missing controller configuration: " + ", ".join(missing))
