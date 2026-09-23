@@ -8,7 +8,6 @@ from .conftest import make_cr, make_cronjob_template
 def test_jobs_clone_argocd_managed_suspended_cronjob_templates():
     settings = Settings(
         artifact_endpoint="https://objects.example.test",
-        argocd_application_name="llm-gateway",
     )
     cr = make_cr()
     optimizer_template = make_cronjob_template("optimizer")
@@ -30,17 +29,9 @@ def test_jobs_clone_argocd_managed_suspended_cronjob_templates():
 
     assert optimizer["metadata"]["name"] == optimizer_job_name(cr["metadata"]["uid"])
     assert diffuser["metadata"]["name"] == diffuser_job_name(cr["metadata"]["uid"])
-    assert optimizer["metadata"]["annotations"] == {
-        "argocd.argoproj.io/tracking-id": (
-            f"llm-gateway:batch/Job:images/{optimizer['metadata']['name']}"
-        ),
-        "argocd.argoproj.io/compare-options": "IgnoreExtraneous",
-        "argocd.argoproj.io/sync-options": "Prune=false",
-    }
+    assert "annotations" not in optimizer["metadata"]
     configmap = optimizer_configmap(cr, settings)
-    assert configmap["metadata"]["annotations"]["argocd.argoproj.io/tracking-id"].startswith(
-        "llm-gateway:/ConfigMap:images/"
-    )
+    assert "annotations" not in configmap["metadata"]
     for job in (optimizer, diffuser):
         spec = job["spec"]
         assert spec["backoffLimit"] == 0
@@ -90,11 +81,8 @@ def test_running_cronjob_cannot_be_used_as_a_template():
         raise AssertionError("an active CronJob must not be used as a template")
 
 
-def test_server_job_has_no_request_configmap_and_is_argocd_tracked():
-    settings = Settings(
-        artifact_endpoint="https://objects.example.test",
-        argocd_application_name="llm-gateway",
-    )
+def test_server_job_has_no_request_configmap_or_argocd_tracking():
+    settings = Settings(artifact_endpoint="https://objects.example.test")
     cr = make_cr()
     cr["metadata"]["namespace"] = "images"
     server = job_from_cronjob(
@@ -108,6 +96,4 @@ def test_server_job_has_no_request_configmap_and_is_argocd_tracked():
     pod_spec = server["spec"]["template"]["spec"]
     assert server["metadata"]["name"] == server_job_name(cr["metadata"]["uid"])
     assert all(volume["name"] != "input" for volume in pod_spec["volumes"])
-    assert server["metadata"]["annotations"]["argocd.argoproj.io/tracking-id"] == (
-        f"llm-gateway:batch/Job:images/{server['metadata']['name']}"
-    )
+    assert "annotations" not in server["metadata"]

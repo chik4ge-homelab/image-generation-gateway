@@ -96,6 +96,22 @@ class KubernetesCluster:
         except Exception as exc:
             raise self._api_error(exc) from exc
 
+    def delete_request(self, namespace: str, name: str) -> None:
+        try:
+            self.custom.delete_namespaced_custom_object(
+                "homelab.chik4ge.me",
+                "v1alpha1",
+                namespace,
+                "imagegenerationrequests",
+                name,
+                propagation_policy="Foreground",
+            )
+        except Exception as exc:
+            error = self._api_error(exc)
+            if isinstance(error, NotFoundError):
+                return
+            raise error from exc
+
     def patch_request_status(
         self, namespace: str, name: str, status: dict[str, Any], resource_version: str | None = None
     ) -> dict[str, Any]:

@@ -9,7 +9,6 @@ class Settings:
     namespace: str = "default"
     artifact_endpoint: str = ""
     artifact_prefix: str = "image-generation"
-    argocd_application_name: str = ""
     llm_namespace: str = "llm-gateway"
     llm_deployment_name: str = "llama-cpp"
     llm_pod_label_selector: str = "app.kubernetes.io/name=llm-gateway"
@@ -27,7 +26,6 @@ class Settings:
             namespace=os.getenv("IMAGE_NAMESPACE", cls.namespace),
             artifact_endpoint=os.getenv("ARTIFACT_ENDPOINT", ""),
             artifact_prefix=os.getenv("ARTIFACT_PREFIX", cls.artifact_prefix),
-            argocd_application_name=os.getenv("ARGOCD_APPLICATION_NAME", ""),
             llm_namespace=os.getenv("LLM_NAMESPACE", cls.llm_namespace),
             llm_deployment_name=os.getenv("LLM_DEPLOYMENT_NAME", cls.llm_deployment_name),
             llm_pod_label_selector=os.getenv(
@@ -59,7 +57,6 @@ class Settings:
             name
             for name, value in (
                 ("ARTIFACT_ENDPOINT", self.artifact_endpoint),
-                ("ARGOCD_APPLICATION_NAME", self.argocd_application_name),
             )
             if not value
         ]

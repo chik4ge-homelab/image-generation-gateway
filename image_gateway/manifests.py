@@ -4,7 +4,6 @@ import json
 from copy import deepcopy
 from typing import Any
 
-from .argocd import tracking_annotations
 from .config import Settings
 from .naming import (
     diffuser_configmap_name,
@@ -46,13 +45,6 @@ def _input_configmap(
             "namespace": namespace,
             "ownerReferences": [owner],
             "labels": {"app.kubernetes.io/part-of": "image-generation"},
-            "annotations": tracking_annotations(
-                settings.argocd_application_name,
-                group="",
-                kind="ConfigMap",
-                namespace=namespace,
-                name=name,
-            ),
         },
         "data": {"input.json": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
     }
@@ -137,25 +129,19 @@ def job_from_cronjob(
     pod_labels.update({"job-name": name, "image-job": name})
     pod_metadata["labels"] = pod_labels
     annotations = deepcopy(job_template.get("metadata", {}).get("annotations", {}))
-    annotations.update(
-        tracking_annotations(
-            settings.argocd_application_name,
-            group="batch",
-            kind="Job",
-            namespace=namespace,
-            name=name,
-        )
-    )
+
+    metadata = {
+        "name": name,
+        "namespace": namespace,
+        "ownerReferences": [owner_reference(cr)],
+        "labels": labels,
+    }
+    if annotations:
+        metadata["annotations"] = annotations
 
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "ownerReferences": [owner_reference(cr)],
-            "labels": labels,
-            "annotations": annotations,
-        },
+        "metadata": metadata,
         "spec": job_spec,
     }

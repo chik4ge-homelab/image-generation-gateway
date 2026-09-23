@@ -59,7 +59,6 @@ def test_openai_generations_preserves_upstream_contract_and_prompt(monkeypatch):
             cluster=cluster,
             settings=Settings(
                 namespace="images",
-                argocd_application_name="llm-gateway",
                 llm_gateway_api_key="secret",
             ),
         )
@@ -95,6 +94,10 @@ def test_openai_generations_preserves_upstream_contract_and_prompt(monkeypatch):
     generated = next(iter(cluster.requests.values()))
     assert generated["spec"]["operation"] == "openai"
     assert generated["spec"]["suspend"] is False
+    assert not any(
+        key.startswith("argocd.argoproj.io/")
+        for key in generated["metadata"].get("annotations", {})
+    )
     assert "prompt" not in generated["spec"]
 
 
@@ -121,7 +124,6 @@ def test_openai_edits_streams_multipart_body_unchanged(monkeypatch):
             settings=Settings(
                 namespace="images",
                 llm_gateway_api_key="secret",
-                argocd_application_name="llm-gateway",
             ),
         )
     )

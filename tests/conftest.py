@@ -20,6 +20,7 @@ class FakeCluster:
         self.outputs = {}
         self.scales = []
         self.deleted_jobs = set()
+        self.deleted_requests = set()
         self.job_endpoints = {}
         self.pods_gone = True
         self.uid = "12345678-1234-1234-1234-123456789abc"
@@ -64,6 +65,18 @@ class FakeCluster:
 
     def list_requests(self, namespace):
         return [copy.deepcopy(value) for (ns, _), value in self.requests.items() if ns == namespace]
+
+    def delete_request(self, namespace, name):
+        request = self.requests.pop((namespace, name), None)
+        if request is None:
+            return
+        self.deleted_requests.add((namespace, name))
+        uid = request["metadata"].get("uid")
+        for resources in (self.configmaps, self.jobs):
+            for key, resource in list(resources.items()):
+                owners = resource.get("metadata", {}).get("ownerReferences", [])
+                if any(owner.get("uid") == uid for owner in owners):
+                    resources.pop(key)
 
     def patch_request_status(self, namespace, name, status, resource_version=None):
         result = self.get_request(namespace, name)

@@ -11,7 +11,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi import Request as FastAPIRequest
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .argocd import tracking_annotations
 from .cluster import ClusterError, KubernetesCluster
 from .config import Settings
 from .models import ProbeResponse
@@ -140,13 +139,6 @@ def create_app(*, cluster: Any | None = None, settings: Settings | None = None) 
                 "name": name,
                 "namespace": settings.namespace,
                 "labels": {"app.kubernetes.io/part-of": "image-generation"},
-                "annotations": tracking_annotations(
-                    settings.argocd_application_name,
-                    group="homelab.chik4ge.me",
-                    kind="ImageGenerationRequest",
-                    namespace=settings.namespace,
-                    name=name,
-                ),
             },
             "spec": spec,
         }

@@ -26,6 +26,7 @@ from .naming import (
 from .validation import StrictJSONError, parse_artifact_output, parse_optimizer_output
 
 LOGGER = logging.getLogger(__name__)
+FAILED_OPENAI_REQUEST_RETENTION_SECONDS = 60
 
 
 class Controller:
@@ -46,6 +47,11 @@ class Controller:
                 item["metadata"]["name"],
             ),
         )
+        deleted = self._cleanup_terminal_requests(requests)
+        if deleted:
+            requests = [
+                item for item in requests if item["metadata"]["name"] not in deleted
+            ]
         active = [
             cr
             for cr in requests
@@ -68,7 +74,53 @@ class Controller:
             cr = self.cluster.get_request(self.settings.namespace, cr["metadata"]["name"])
             self.reconcile(cr)
             return True
-        return False
+        return bool(deleted)
+
+    def _cleanup_terminal_requests(self, requests: list[dict[str, Any]]) -> set[str]:
+        active_server_jobs = {
+            status["serverJobName"]
+            for request in requests
+            if (status := request.get("status", {})).get("phase")
+            not in TERMINAL_PHASES | {"Pending"}
+            and status.get("serverJobName")
+        }
+        deleted: set[str] = set()
+        for request in requests:
+            name = request["metadata"]["name"]
+            status = request.get("status", {})
+            phase = status.get("phase")
+            if phase not in TERMINAL_PHASES:
+                continue
+            metadata = request.get("metadata", {})
+            annotations = metadata.get("annotations", {})
+            labels = metadata.get("labels", {})
+            if (
+                "argocd.argoproj.io/tracking-id" in annotations
+                or "app.kubernetes.io/instance" in labels
+            ):
+                continue
+            if status.get("serverJobName") in active_server_jobs:
+                continue
+            if phase == "Failed" and not self._failure_retention_elapsed(status):
+                continue
+            try:
+                self.cluster.delete_request(self.settings.namespace, name)
+                deleted.add(name)
+            except Exception:
+                LOGGER.exception("failed to delete terminal image request %s", name)
+        return deleted
+
+    @staticmethod
+    def _failure_retention_elapsed(status: dict[str, Any]) -> bool:
+        completed_at = status.get("completedAt")
+        if not completed_at:
+            return False
+        try:
+            completed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return False
+        age = datetime.now(UTC) - completed
+        return age.total_seconds() >= FAILED_OPENAI_REQUEST_RETENTION_SECONDS
 
     def run_forever(self) -> None:
         while True:

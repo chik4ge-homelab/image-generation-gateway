@@ -25,13 +25,13 @@ The API listens on port `IMAGE_GATEWAY_PORT` (default `8080`). The controller po
 
 The controller requires these environment variables:
 
-`IMAGE_NAMESPACE`, `ARTIFACT_ENDPOINT`, and `ARGOCD_APPLICATION_NAME`.
+`IMAGE_NAMESPACE` and `ARTIFACT_ENDPOINT`.
 
 Optional settings are `ARTIFACT_PREFIX`, `LLM_NAMESPACE`, `LLM_DEPLOYMENT_NAME`, `LLM_POD_LABEL_SELECTOR`, `LLM_STOP_TIMEOUT_SECONDS`, `LLM_RESTORE_TIMEOUT_SECONDS`, and `CONTROLLER_POLL_INTERVAL_SECONDS`.
 
 The older artifact-mode CR path still uses optimizer and diffuser CronJobs and object storage. The public OpenAI image routes create `openai` requests and bypass that pipeline, forwarding the original request directly to stable-diffusion.cpp.
 
-The API process creates and reads `ImageGenerationRequest` records and patches their status when proxying finishes. Argo CD manages suspended optimizer, diffuser, and stable-diffusion server CronJobs as dormant Job templates; the controller creates Argo-tracked per-request Jobs without unsuspending the CronJobs. The controller uses custom-resource polling/status updates, the named Deployment scale subresource, CronJobs, Jobs, Pods, and ConfigMaps. Deployment manifests and RBAC are intentionally left to `homelab-applications`.
+The API creates temporary `ImageGenerationRequest` queue records and patches their status when proxying finishes. The controller removes completed untracked requests after the shared server is no longer in use, and removes failed requests after a short retention period. Kubernetes garbage collection then removes request-owned Jobs and ConfigMaps. Argo CD manages suspended optimizer, diffuser, and stable-diffusion server CronJobs as dormant Job templates; the controller creates untracked per-request Jobs from those templates without unsuspending the CronJobs. The controller uses custom-resource polling/status updates, the named Deployment scale subresource, CronJobs, Jobs, Pods, and ConfigMaps. Deployment manifests and RBAC are intentionally left to `homelab-applications`.
 
 ## Checks
 

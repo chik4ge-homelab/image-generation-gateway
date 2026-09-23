@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from image_gateway.config import Settings
 from image_gateway.controller import Controller
 from image_gateway.naming import diffuser_job_name, optimizer_job_name, server_job_name
@@ -9,7 +11,6 @@ def controller_settings():
     return Settings(
         namespace="images",
         artifact_endpoint="https://objects.example.test",
-        argocd_application_name="llm-gateway",
     )
 
 
@@ -210,3 +211,77 @@ def test_openai_requests_never_start_the_prompt_optimizer():
     assert cluster.get_request("images", first["metadata"]["name"])["status"]["phase"] == (
         "StartingServer"
     )
+
+
+def test_completed_untracked_request_is_deleted_with_owned_temporary_resources():
+    cluster = FakeCluster()
+    cr = make_cr("igr-artifact-complete")
+    cr["status"] = {"phase": "Succeeded"}
+    cluster.requests[("images", cr["metadata"]["name"])] = cr
+    cluster.configmaps[("images", "request-input")] = {
+        "metadata": {"ownerReferences": [{"uid": cr["metadata"]["uid"]}]}
+    }
+
+    assert Controller(cluster, controller_settings()).run_once()
+
+    assert ("images", cr["metadata"]["name"]) in cluster.deleted_requests
+    assert ("images", cr["metadata"]["name"]) not in cluster.requests
+    assert ("images", "request-input") not in cluster.configmaps
+
+
+def test_old_failed_untracked_request_is_deleted_after_retention():
+    cluster = FakeCluster()
+    cr = make_cr("igr-artifact-failed")
+    cr["status"] = {"phase": "Failed", "completedAt": "2020-01-01T00:00:00Z"}
+    cluster.requests[("images", cr["metadata"]["name"])] = cr
+
+    assert Controller(cluster, controller_settings()).run_once()
+    assert ("images", cr["metadata"]["name"]) in cluster.deleted_requests
+
+
+def test_recent_failed_untracked_request_is_retained_for_error_response():
+    cluster = FakeCluster()
+    cr = make_cr("igr-artifact-failed-recent")
+    cr["status"] = {
+        "phase": "Failed",
+        "completedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
+    cluster.requests[("images", cr["metadata"]["name"])] = cr
+
+    assert Controller(cluster, controller_settings()).run_once() is False
+    assert ("images", cr["metadata"]["name"]) in cluster.requests
+
+
+def test_terminal_argocd_managed_requests_are_not_deleted():
+    cluster = FakeCluster()
+    cr = make_cr("igr-git-managed")
+    cr["metadata"]["annotations"] = {
+        "argocd.argoproj.io/tracking-id": (
+            "llm-gateway:homelab.chik4ge.me/ImageGenerationRequest:"
+            "llm-gateway/igr-git-managed"
+        )
+    }
+    cr["status"] = {"phase": "Succeeded"}
+    cluster.requests[("images", cr["metadata"]["name"])] = cr
+
+    assert Controller(cluster, controller_settings()).run_once() is False
+    assert ("images", cr["metadata"]["name"]) in cluster.requests
+
+
+def test_openai_request_owning_shared_server_waits_for_other_requests():
+    cluster = FakeCluster()
+    first = make_cr("igr-openai-complete")
+    first["spec"].update({"operation": "openai", "suspend": False})
+    first["status"] = {"phase": "Succeeded", "serverJobName": "shared-server"}
+    second = make_cr("igr-openai-active")
+    second["metadata"]["uid"] = "87654321-4321-4321-4321-cba987654321"
+    second["spec"].update({"operation": "openai", "suspend": False})
+    second["status"] = {"phase": "Proxying", "serverJobName": "shared-server"}
+    cluster.requests[("images", first["metadata"]["name"])] = first
+    cluster.requests[("images", second["metadata"]["name"])] = second
+    cluster.jobs[("images", "shared-server")] = {"status": {}}
+
+    Controller(cluster, controller_settings()).run_once()
+
+    assert ("images", first["metadata"]["name"]) in cluster.requests
+    assert ("images", first["metadata"]["name"]) not in cluster.deleted_requests
