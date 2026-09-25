@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import time
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -61,9 +62,7 @@ def _response_headers(headers: httpx.Headers) -> dict[str, str]:
         "upgrade",
     }
     connection_tokens = {
-        token.strip().lower()
-        for token in headers.get("connection", "").split(",")
-        if token.strip()
+        token.strip().lower() for token in headers.get("connection", "").split(",") if token.strip()
     }
     blocked = hop_by_hop | connection_tokens
     return {key: value for key, value in headers.items() if key.lower() not in blocked}
@@ -137,7 +136,10 @@ def create_app(*, cluster: Any | None = None, settings: Settings | None = None) 
             "metadata": {
                 "name": name,
                 "namespace": settings.namespace,
-                "labels": {"app.kubernetes.io/part-of": "image-generation"},
+                "labels": {
+                    "app.kubernetes.io/part-of": "image-generation",
+                    "app.kubernetes.io/managed-by": "image-generation-api",
+                },
             },
             "spec": spec,
         }
@@ -151,97 +153,179 @@ def create_app(*, cluster: Any | None = None, settings: Settings | None = None) 
                 status_code=503,
             )
 
-        deadline = time.monotonic() + settings.image_generation_timeout_seconds
-        try:
-            while True:
-                cr = await asyncio.to_thread(cluster.get_request, settings.namespace, name)
-                status = cr.get("status", {})
-                phase = status.get("phase", "Pending")
-                if phase == "Proxying" and status.get("serverUrl"):
-                    break
-                if phase == "Failed":
-                    failure = status.get("failure", {})
-                    return _openai_error(
-                        failure.get("message", "image generation failed"),
-                        error_type="server_error",
-                        code="image_generation_failed",
-                        status_code=500,
-                    )
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    await asyncio.to_thread(
-                        cluster.patch_request_status,
-                        settings.namespace,
-                        name,
-                        {"phase": "RestoringText"},
-                    )
-                    return _openai_error(
-                        "image generation timed out",
-                        error_type="server_error",
-                        code="image_generation_timeout",
-                        status_code=504,
-                    )
-                await asyncio.sleep(min(settings.api_poll_interval_seconds, remaining))
-        except ClusterError:
-            return _openai_error(
-                "image generation request could not be read",
-                error_type="server_error",
-                code="request_read_failed",
-                status_code=503,
-            )
+        def timestamp() -> str:
+            return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
-        content: bytes | Any = raw_body if raw_body is not None else http_request.stream()
-        target = status["serverUrl"].rstrip("/") + http_request.url.path
-        if http_request.url.query:
-            target += "?" + http_request.url.query
-        client = _sd_client(settings.image_generation_timeout_seconds)
-        try:
-            upstream_request = client.build_request(
-                "POST",
-                target,
-                headers=_forward_request_headers(http_request),
-                content=content,
-            )
-            upstream = await client.send(upstream_request, stream=True)
-        except Exception:
-            await client.aclose()
-            await asyncio.to_thread(
-                cluster.patch_request_status,
-                settings.namespace,
-                name,
-                {"phase": "RestoringText"},
-            )
-            return _openai_error(
-                "stable-diffusion.cpp request failed",
-                error_type="server_error",
-                code="image_generation_failed",
-                status_code=502,
-            )
-
-        async def response_stream():
+        async def restore_request() -> None:
             try:
-                if upstream.is_stream_consumed:
-                    yield upstream.content
-                else:
-                    async for chunk in upstream.aiter_raw():
-                        yield chunk
-            finally:
-                await upstream.aclose()
-                await client.aclose()
+                await asyncio.to_thread(
+                    cluster.patch_request_status,
+                    settings.namespace,
+                    name,
+                    {"phase": "RestoringText"},
+                )
+            except Exception:
+                pass
+
+        async def renew_lease() -> None:
+            while True:
+                await asyncio.sleep(settings.request_heartbeat_interval_seconds)
                 try:
                     await asyncio.to_thread(
                         cluster.patch_request_status,
                         settings.namespace,
                         name,
-                        {"phase": "RestoringText"},
+                        {"lastHeartbeatAt": timestamp()},
                     )
                 except Exception:
-                    pass
+                    continue
 
-        return StreamingResponse(
-            response_stream(),
-            status_code=upstream.status_code,
-            headers=_response_headers(upstream.headers),
-        )
+        try:
+            await asyncio.to_thread(
+                cluster.patch_request_status,
+                settings.namespace,
+                name,
+                {"lastHeartbeatAt": timestamp()},
+            )
+        except Exception:
+            pass
+        heartbeat_task = asyncio.create_task(renew_lease())
+        heartbeat_transferred = False
+        body_consumed = asyncio.Event()
+        if raw_body is not None:
+            body_consumed.set()
+
+        async def stop_heartbeat() -> None:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+        try:
+            deadline = time.monotonic() + settings.image_generation_timeout_seconds
+            try:
+                while True:
+                    cr = await asyncio.to_thread(cluster.get_request, settings.namespace, name)
+                    status = cr.get("status", {})
+                    phase = status.get("phase", "Pending")
+                    if phase == "Proxying" and status.get("serverUrl"):
+                        break
+                    if body_consumed.is_set() and await http_request.is_disconnected():
+                        await restore_request()
+                        return _openai_error(
+                            "image generation client disconnected",
+                            error_type="server_error",
+                            code="client_disconnected",
+                            status_code=499,
+                        )
+                    if phase == "Failed":
+                        failure = status.get("failure", {})
+                        return _openai_error(
+                            failure.get("message", "image generation failed"),
+                            error_type="server_error",
+                            code="image_generation_failed",
+                            status_code=500,
+                        )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        await restore_request()
+                        return _openai_error(
+                            "image generation timed out",
+                            error_type="server_error",
+                            code="image_generation_timeout",
+                            status_code=504,
+                        )
+                    await asyncio.sleep(min(settings.api_poll_interval_seconds, remaining))
+            except ClusterError:
+                await restore_request()
+                return _openai_error(
+                    "image generation request could not be read",
+                    error_type="server_error",
+                    code="request_read_failed",
+                    status_code=503,
+                )
+
+            if raw_body is not None:
+                content: bytes | Any = raw_body
+            else:
+
+                async def request_body():
+                    try:
+                        async for chunk in http_request.stream():
+                            yield chunk
+                    finally:
+                        body_consumed.set()
+
+                content = request_body()
+            target = status["serverUrl"].rstrip("/") + http_request.url.path
+            if http_request.url.query:
+                target += "?" + http_request.url.query
+            client = _sd_client(settings.image_generation_timeout_seconds)
+            send_task: asyncio.Task[httpx.Response] | None = None
+            try:
+                upstream_request = client.build_request(
+                    "POST",
+                    target,
+                    headers=_forward_request_headers(http_request),
+                    content=content,
+                )
+                send_task = asyncio.create_task(client.send(upstream_request, stream=True))
+                while not send_task.done():
+                    if body_consumed.is_set() and await http_request.is_disconnected():
+                        send_task.cancel()
+                        await asyncio.gather(send_task, return_exceptions=True)
+                        await client.aclose()
+                        await restore_request()
+                        return _openai_error(
+                            "image generation client disconnected",
+                            error_type="server_error",
+                            code="client_disconnected",
+                            status_code=499,
+                        )
+                    await asyncio.wait({send_task}, timeout=1)
+                upstream = await send_task
+            except asyncio.CancelledError:
+                if send_task is not None:
+                    send_task.cancel()
+                    await asyncio.gather(send_task, return_exceptions=True)
+                await client.aclose()
+                raise
+            except Exception:
+                await client.aclose()
+                await restore_request()
+                return _openai_error(
+                    "stable-diffusion.cpp request failed",
+                    error_type="server_error",
+                    code="image_generation_failed",
+                    status_code=502,
+                )
+
+            async def response_stream():
+                try:
+                    if upstream.is_stream_consumed:
+                        yield upstream.content
+                    else:
+                        async for chunk in upstream.aiter_raw():
+                            yield chunk
+                finally:
+                    try:
+                        await upstream.aclose()
+                    finally:
+                        try:
+                            await client.aclose()
+                        finally:
+                            await stop_heartbeat()
+                            await restore_request()
+
+            heartbeat_transferred = True
+            return StreamingResponse(
+                response_stream(),
+                status_code=upstream.status_code,
+                headers=_response_headers(upstream.headers),
+            )
+        except asyncio.CancelledError:
+            await restore_request()
+            raise
+        finally:
+            if not heartbeat_transferred:
+                await stop_heartbeat()
 
     return app

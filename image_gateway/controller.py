@@ -34,14 +34,31 @@ class Controller:
         )
         deleted = self._cleanup_terminal_requests(requests)
         if deleted:
-            requests = [
-                item for item in requests if item["metadata"]["name"] not in deleted
-            ]
+            requests = [item for item in requests if item["metadata"]["name"] not in deleted]
+        for cr in requests:
+            phase = cr.get("status", {}).get("phase", "Pending")
+            if phase in TERMINAL_PHASES | {"RestoringText"}:
+                continue
+            status = cr.get("status", {})
+            if self._uses_request_lease(cr) and not status.get("lastHeartbeatAt"):
+                self._initialize_request_lease(cr)
+                return True
+            if not self._request_lease_expired(cr):
+                continue
+            if phase == "Pending":
+                self._fail_pending_request(cr)
+            else:
+                self._fail(
+                    cr,
+                    phase,
+                    "RequestLeaseExpired",
+                    "image API stopped renewing the request lease",
+                )
+            return True
         active = [
             cr
             for cr in requests
-            if cr.get("status", {}).get("phase", "Pending")
-            not in TERMINAL_PHASES | {"Pending"}
+            if cr.get("status", {}).get("phase", "Pending") not in TERMINAL_PHASES | {"Pending"}
         ]
         if active:
             self.reconcile(active[0])
@@ -386,6 +403,53 @@ class Controller:
             return False
         elapsed = (datetime.now(UTC) - started).total_seconds()
         return elapsed >= self.settings.image_generation_timeout_seconds
+
+    def _request_lease_expired(self, cr: dict[str, Any]) -> bool:
+        heartbeat_at = cr.get("status", {}).get("lastHeartbeatAt")
+        if not heartbeat_at:
+            return False
+        try:
+            heartbeat = datetime.fromisoformat(heartbeat_at.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError):
+            return True
+        elapsed = (datetime.now(UTC) - heartbeat).total_seconds()
+        return elapsed >= self.settings.request_lease_timeout_seconds
+
+    @staticmethod
+    def _uses_request_lease(cr: dict[str, Any]) -> bool:
+        metadata = cr.get("metadata", {})
+        managed_by = metadata.get("labels", {}).get("app.kubernetes.io/managed-by")
+        request_id = cr.get("spec", {}).get("idempotencyKey", "")
+        return managed_by == "image-generation-api" or (
+            isinstance(request_id, str) and request_id.startswith("openai-")
+        )
+
+    def _initialize_request_lease(self, cr: dict[str, Any]) -> None:
+        try:
+            self.cluster.patch_request_status(
+                self.settings.namespace,
+                cr["metadata"]["name"],
+                {"lastHeartbeatAt": self._now()},
+            )
+        except Exception:
+            LOGGER.exception("failed to initialize image request lease %s", cr["metadata"]["name"])
+
+    def _fail_pending_request(self, cr: dict[str, Any]) -> None:
+        status = {
+            "phase": "Failed",
+            "completedAt": self._now(),
+            "failure": {
+                "stage": "Pending",
+                "reason": "RequestLeaseExpired",
+                "message": "image API stopped renewing the queued request lease",
+            },
+        }
+        try:
+            self.cluster.patch_request_status(
+                self.settings.namespace, cr["metadata"]["name"], status
+            )
+        except Exception:
+            LOGGER.exception("failed to expire queued image request %s", cr["metadata"]["name"])
 
     def _fail(self, cr: dict[str, Any], stage: str, reason: str, message: str) -> None:
         conditions: list[dict[str, Any]] = []
